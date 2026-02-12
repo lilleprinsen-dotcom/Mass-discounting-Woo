@@ -617,7 +617,56 @@ final class LPMD_Mass_Discounts {
 	 * Dirty queue processor: recompute best discount and persist meta
 	 * ------------------------------------------------------------ */
 
-	public function handle_dirty_queue($args = []) {
+	private function normalize_job_reason($args, $reason_fallback = '') {
+		if (is_array($args) && isset($args['reason'])) {
+			return sanitize_text_field((string)$args['reason']);
+		}
+		if (is_string($args) && $args !== '') {
+			return sanitize_text_field($args);
+		}
+		if (is_string($reason_fallback) && $reason_fallback !== '') {
+			return sanitize_text_field($reason_fallback);
+		}
+		return 'unknown';
+	}
+
+	private function normalize_term_handler_args($args, $term_id_fallback = 0, $reason_fallback = '') {
+		if (is_array($args) && isset($args['taxonomy'], $args['term_id'])) {
+			return [
+				'taxonomy' => sanitize_text_field((string)$args['taxonomy']),
+				'term_id'  => (int)$args['term_id'],
+				'reason'   => $this->normalize_job_reason($args, $reason_fallback),
+			];
+		}
+
+		$taxonomy = is_string($args) ? sanitize_text_field($args) : '';
+		return [
+			'taxonomy' => $taxonomy,
+			'term_id'  => (int)$term_id_fallback,
+			'reason'   => $this->normalize_job_reason([], $reason_fallback),
+		];
+	}
+
+	private function normalize_batch_handler_args($args, $reason_fallback = '') {
+		if (is_array($args) && isset($args['product_ids']) && is_array($args['product_ids'])) {
+			return [
+				'product_ids' => $args['product_ids'],
+				'reason'      => $this->normalize_job_reason($args, $reason_fallback),
+			];
+		}
+
+		if (is_array($args)) {
+			return [
+				'product_ids' => $args,
+				'reason'      => $this->normalize_job_reason([], $reason_fallback),
+			];
+		}
+
+		return ['product_ids' => [], 'reason' => $this->normalize_job_reason([], $reason_fallback)];
+	}
+
+	public function handle_dirty_queue($args = [], $reason_fallback = '') {
+		$reason = $this->normalize_job_reason($args, $reason_fallback);
 		update_option(self::OPT_DIRTY_SCHEDULED, 'no', false);
 
 		$queue = get_option(self::OPT_DIRTY_QUEUE, []);
@@ -638,7 +687,7 @@ final class LPMD_Mass_Discounts {
 		$this->stats_set('last_dirty_run', date_i18n('Y-m-d H:i:s', $this->now_ts()));
 		$this->stats_set('last_dirty_processed', $total);
 
-		$this->log('Dirty queue processing started', ['count'=>$total, 'reason'=>$args['reason'] ?? 'unknown']);
+		$this->log('Dirty queue processing started', ['count'=>$total, 'reason'=>$reason]);
 
 		$chunks = array_chunk($product_ids, $batch_size);
 		foreach ($chunks as $chunk) {
@@ -650,9 +699,11 @@ final class LPMD_Mass_Discounts {
 	 * Scheduled term apply/remove handlers
 	 * ------------------------------------------------------------ */
 
-	public function handle_apply_term_rule($args = [], $reason_fallback = '') {
-		$taxonomy = isset($args['taxonomy']) ? sanitize_text_field($args['taxonomy']) : '';
-		$term_id  = isset($args['term_id']) ? (int)$args['term_id'] : 0;
+	public function handle_apply_term_rule($args = [], $term_id_fallback = 0, $reason_fallback = '') {
+		$normalized = $this->normalize_term_handler_args($args, $term_id_fallback, $reason_fallback);
+		$taxonomy = $normalized['taxonomy'];
+		$term_id  = $normalized['term_id'];
+		$reason   = $normalized['reason'];
 		if (!$taxonomy || !$term_id || !taxonomy_exists($taxonomy)) return;
 
 		$rule = $this->get_rule_for_term($taxonomy, $term_id);
@@ -669,7 +720,7 @@ final class LPMD_Mass_Discounts {
 
 		// Process all products in this term (max ~3k per user note)
 		$product_ids = $this->get_product_ids_in_term($taxonomy, $term_id);
-		$this->log('Applying term rule', ['taxonomy'=>$taxonomy, 'term_id'=>$term_id, 'count'=>count($product_ids), 'reason'=>$args['reason'] ?? $reason_fallback]);
+		$this->log('Applying term rule', ['taxonomy'=>$taxonomy, 'term_id'=>$term_id, 'count'=>count($product_ids), 'reason'=>$reason]);
 
 		$settings = $this->get_settings();
 		$batch_size = max(20, (int)($settings['batch_size'] ?? self::DEFAULT_BATCH_SIZE));
@@ -678,14 +729,16 @@ final class LPMD_Mass_Discounts {
 		}
 	}
 
-	public function handle_remove_term_rule($args = [], $reason_fallback = '') {
-		$taxonomy = isset($args['taxonomy']) ? sanitize_text_field($args['taxonomy']) : '';
-		$term_id  = isset($args['term_id']) ? (int)$args['term_id'] : 0;
+	public function handle_remove_term_rule($args = [], $term_id_fallback = 0, $reason_fallback = '') {
+		$normalized = $this->normalize_term_handler_args($args, $term_id_fallback, $reason_fallback);
+		$taxonomy = $normalized['taxonomy'];
+		$term_id  = $normalized['term_id'];
+		$reason   = $normalized['reason'];
 		if (!$taxonomy || !$term_id || !taxonomy_exists($taxonomy)) return;
 
 		// Removing: recompute best discount for products in term
 		$product_ids = $this->get_product_ids_in_term($taxonomy, $term_id);
-		$this->log('Removing term rule (recompute best discount)', ['taxonomy'=>$taxonomy, 'term_id'=>$term_id, 'count'=>count($product_ids), 'reason'=>$args['reason'] ?? $reason_fallback]);
+		$this->log('Removing term rule (recompute best discount)', ['taxonomy'=>$taxonomy, 'term_id'=>$term_id, 'count'=>count($product_ids), 'reason'=>$reason]);
 
 		$settings = $this->get_settings();
 		$batch_size = max(20, (int)($settings['batch_size'] ?? self::DEFAULT_BATCH_SIZE));
@@ -729,10 +782,12 @@ final class LPMD_Mass_Discounts {
 	 * Product batch processor: compute best discount + persist prices
 	 * ------------------------------------------------------------ */
 
-	public function handle_product_batch($args = []) {
+	public function handle_product_batch($args = [], $reason_fallback = '') {
 		$start = microtime(true);
 
-		$product_ids = $args['product_ids'] ?? [];
+		$normalized = $this->normalize_batch_handler_args($args, $reason_fallback);
+		$product_ids = $normalized['product_ids'];
+		$reason = $normalized['reason'];
 		if (!is_array($product_ids) || empty($product_ids)) return;
 
 		$settings = $this->get_settings();
@@ -788,9 +843,9 @@ final class LPMD_Mass_Discounts {
 		$this->stats_set('last_batch_processed', $processed);
 		if (!empty($errors)) {
 			$this->stats_set('last_errors', array_slice($errors, 0, 10));
-			$this->log('Batch errors', ['errors'=>array_slice($errors, 0, 10), 'reason'=>$args['reason'] ?? 'unknown']);
+			$this->log('Batch errors', ['errors'=>array_slice($errors, 0, 10), 'reason'=>$reason]);
 		}
-		$this->log('Processed product batch', ['count'=>$processed, 'duration_ms'=>$dur_ms, 'reason'=>$args['reason'] ?? 'unknown']);
+		$this->log('Processed product batch', ['count'=>$processed, 'duration_ms'=>$dur_ms, 'reason'=>$reason]);
 	}
 
 	private function apply_best_discount_to_item($item_id, $parent_product_id, &$active_rule_cache, $override_other_sales, $min_price_floor) {
