@@ -66,6 +66,7 @@ final class LPMD_Mass_Discounts {
 
 		// Admin UI
 		add_action('admin_menu', [$this, 'admin_menu']);
+		add_action('wp_ajax_lpmd_jobs_progress', [$this, 'ajax_jobs_progress']);
 
 		// Term relationship watchers (auto-discount when product added/removed)
 		add_action('added_term_relationship', [$this, 'on_term_relationship_change'], 10, 3);
@@ -163,6 +164,71 @@ final class LPMD_Mass_Discounts {
 	private function stats_get_all() {
 		$stats = get_option(self::OPT_STATS, []);
 		return is_array($stats) ? $stats : [];
+	}
+
+	private function stats_increment($key, $delta = 1) {
+		$stats = $this->stats_get_all();
+		$current = isset($stats[$key]) ? (int)$stats[$key] : 0;
+		$stats[$key] = max(0, $current + (int)$delta);
+		update_option(self::OPT_STATS, $stats, false);
+		return (int)$stats[$key];
+	}
+
+	private function stats_start_chunk_job($total_chunks, $reason = '') {
+		$this->stats_set('total_chunks', max(0, (int)$total_chunks));
+		$this->stats_set('completed_chunks', 0);
+		$this->stats_set('failed_chunks', 0);
+		$this->stats_set('chunks_started_at', $this->now_ts());
+		$this->stats_set('chunk_job_reason', sanitize_text_field((string)$reason));
+		$this->stats_set('chunk_eta_seconds', null);
+	}
+
+	private function stats_record_chunk_result($status = 'completed') {
+		if ($status === 'failed') {
+			$this->stats_increment('failed_chunks', 1);
+		} else {
+			$this->stats_increment('completed_chunks', 1);
+		}
+
+		$stats = $this->stats_get_all();
+		$total = (int)($stats['total_chunks'] ?? 0);
+		$done = (int)($stats['completed_chunks'] ?? 0) + (int)($stats['failed_chunks'] ?? 0);
+		$started = (int)($stats['chunks_started_at'] ?? 0);
+
+		if ($started > 0 && $total > 0 && $done > 0) {
+			$elapsed = max(1, $this->now_ts() - $started);
+			$avg_per_chunk = $elapsed / $done;
+			$remaining = max(0, $total - $done);
+			$this->stats_set('chunk_eta_seconds', (int)ceil($avg_per_chunk * $remaining));
+		}
+
+		if ($total > 0 && $done >= $total) {
+			$this->stats_set('chunk_eta_seconds', 0);
+			$this->stats_set('chunks_finished_at', $this->now_ts());
+		}
+	}
+
+	private function get_jobs_progress_payload() {
+		$queue = get_option(self::OPT_DIRTY_QUEUE, []);
+		if (!is_array($queue)) $queue = [];
+
+		$stats = $this->stats_get_all();
+		$total = max(0, (int)($stats['total_chunks'] ?? 0));
+		$completed = max(0, (int)($stats['completed_chunks'] ?? 0));
+		$failed = max(0, (int)($stats['failed_chunks'] ?? 0));
+		$done = min($total, $completed + $failed);
+		$percent = ($total > 0) ? (int)round(($done / $total) * 100) : 0;
+
+		return [
+			'total_chunks'     => $total,
+			'completed_chunks' => $completed,
+			'failed_chunks'    => $failed,
+			'processed_chunks' => $done,
+			'progress_percent' => max(0, min(100, $percent)),
+			'eta_seconds'      => max(0, (int)($stats['chunk_eta_seconds'] ?? 0)),
+			'dirty_queue_size' => count($queue),
+			'job_reason'       => (string)($stats['chunk_job_reason'] ?? ''),
+		];
 	}
 
 	/* ------------------------------------------------------------
@@ -468,6 +534,7 @@ final class LPMD_Mass_Discounts {
 		$log = get_option(self::OPT_LOG, []);
 		if (!is_array($log)) $log = [];
 		$stats = $this->stats_get_all();
+		$progress = $this->get_jobs_progress_payload();
 
 		echo '<h2>Status</h2>';
 		echo '<ul>';
@@ -477,6 +544,21 @@ final class LPMD_Mass_Discounts {
 		echo '<li><strong>Override other sales:</strong> '.esc_html($settings['override_other_sales']).'</li>';
 		echo '<li><strong>Brand taxonomy:</strong> '.esc_html($settings['brand_taxonomy']).'</li>';
 		echo '</ul>';
+
+		echo '<h2>Progress</h2>';
+		echo '<div id="lpmd-progress-wrap" style="max-width:720px;">';
+		echo '<div style="height:18px;background:#f0f0f1;border-radius:9px;overflow:hidden;">';
+		echo '<div id="lpmd-progress-bar" style="height:18px;width:'.(int)$progress['progress_percent'].'%;background:#2271b1;transition:width .25s;"></div>';
+		echo '</div>';
+		echo '<p id="lpmd-progress-text" style="margin-top:8px;">'.esc_html(sprintf(
+			'%d%% (%d/%d chunks, failed: %d, ETA: %s)',
+			(int)$progress['progress_percent'],
+			(int)$progress['processed_chunks'],
+			(int)$progress['total_chunks'],
+			(int)$progress['failed_chunks'],
+			$this->format_eta_seconds((int)$progress['eta_seconds'])
+		)).'</p>';
+		echo '</div>';
 
 		echo '<h2>Controls</h2>';
 		echo '<form method="post">';
@@ -488,10 +570,22 @@ final class LPMD_Mass_Discounts {
 
 		echo '<h2>Recent stats</h2>';
 		echo '<table class="widefat striped"><tbody>';
-		foreach (['last_dirty_run','last_dirty_processed','last_batch_run','last_batch_processed','last_errors'] as $k) {
+		foreach (['last_dirty_run','last_dirty_processed','last_batch_run','last_batch_processed','total_chunks','completed_chunks','failed_chunks','chunk_eta_seconds','last_errors'] as $k) {
 			echo '<tr><td style="width:240px;"><strong>'.esc_html($k).'</strong></td><td>'.esc_html(is_scalar($stats[$k] ?? '') ? (string)($stats[$k] ?? '') : wp_json_encode($stats[$k] ?? '')).'</td></tr>';
 		}
 		echo '</tbody></table>';
+
+		$ajax_nonce = wp_create_nonce('lpmd_jobs_progress');
+		echo '<script>';
+		echo '(()=>{const bar=document.getElementById("lpmd-progress-bar");const txt=document.getElementById("lpmd-progress-text");if(!bar||!txt){return;}';
+		echo 'const ajaxUrl='.wp_json_encode(admin_url('admin-ajax.php')).';';
+		echo 'const nonce='.wp_json_encode($ajax_nonce).';';
+		echo 'const formatEta=(s)=>{s=parseInt(s||0,10);if(s<=0)return "0s";const h=Math.floor(s/3600);const m=Math.floor((s%3600)/60);const sec=s%60;return (h?`${h}h `:"")+(m?`${m}m `:"")+`${sec}s`;};';
+		echo 'const tick=()=>{const body=new URLSearchParams({action:"lpmd_jobs_progress",nonce});fetch(ajaxUrl,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded; charset=UTF-8"},body:body.toString()})';
+		echo '.then(r=>r.json()).then(resp=>{if(!resp||!resp.success||!resp.data){return;}const d=resp.data;bar.style.width=`${d.progress_percent}%`;txt.textContent=`${d.progress_percent}% (${d.processed_chunks}/${d.total_chunks} chunks, failed: ${d.failed_chunks}, ETA: ${formatEta(d.eta_seconds)})`;})';
+		echo '.catch(()=>{});};tick();setInterval(tick,3000);';
+		echo '})();';
+		echo '</script>';
 
 		echo '<h2>Log (last 50)</h2>';
 		echo '<table class="widefat striped"><thead><tr><th style="width:170px;">Time</th><th>Message</th><th>Context</th></tr></thead><tbody>';
@@ -510,6 +604,32 @@ final class LPMD_Mass_Discounts {
 		echo '</tbody></table>';
 
 		$this->render_admin_footer();
+	}
+
+	public function ajax_jobs_progress() {
+		if (!current_user_can('manage_woocommerce')) {
+			wp_send_json_error(['message' => 'Forbidden'], 403);
+		}
+
+		$nonce = isset($_POST['nonce']) ? sanitize_text_field(wp_unslash($_POST['nonce'])) : '';
+		if (!wp_verify_nonce($nonce, 'lpmd_jobs_progress')) {
+			wp_send_json_error(['message' => 'Invalid nonce'], 400);
+		}
+
+		wp_send_json_success($this->get_jobs_progress_payload());
+	}
+
+	private function format_eta_seconds($seconds) {
+		$seconds = max(0, (int)$seconds);
+		$hours = (int)floor($seconds / 3600);
+		$minutes = (int)floor(($seconds % 3600) / 60);
+		$secs = $seconds % 60;
+
+		$parts = [];
+		if ($hours > 0) $parts[] = $hours.'h';
+		if ($minutes > 0) $parts[] = $minutes.'m';
+		$parts[] = $secs.'s';
+		return implode(' ', $parts);
 	}
 
 	/* ------------------------------------------------------------
@@ -699,6 +819,7 @@ final class LPMD_Mass_Discounts {
 		$this->log('Dirty queue processing started', ['count'=>$total, 'reason'=>$reason]);
 
 		$chunks = array_chunk($product_ids, $batch_size);
+		$this->stats_start_chunk_job(count($chunks), $reason);
 		foreach ($chunks as $chunk) {
 			$this->enqueue_async(self::AS_PROCESS_PRODUCTS, ['product_ids'=>$chunk, 'reason'=>'dirty_queue'], 'lpmd');
 		}
@@ -733,7 +854,9 @@ final class LPMD_Mass_Discounts {
 
 		$settings = $this->get_settings();
 		$batch_size = max(20, (int)($settings['batch_size'] ?? self::DEFAULT_BATCH_SIZE));
-		foreach (array_chunk($product_ids, $batch_size) as $chunk) {
+		$chunks = array_chunk($product_ids, $batch_size);
+		$this->stats_start_chunk_job(count($chunks), "term_apply:{$taxonomy}:{$term_id}");
+		foreach ($chunks as $chunk) {
 			$this->enqueue_async(self::AS_PROCESS_PRODUCTS, ['product_ids'=>$chunk, 'reason'=>"term_apply:{$taxonomy}:{$term_id}"], 'lpmd');
 		}
 	}
@@ -751,7 +874,9 @@ final class LPMD_Mass_Discounts {
 
 		$settings = $this->get_settings();
 		$batch_size = max(20, (int)($settings['batch_size'] ?? self::DEFAULT_BATCH_SIZE));
-		foreach (array_chunk($product_ids, $batch_size) as $chunk) {
+		$chunks = array_chunk($product_ids, $batch_size);
+		$this->stats_start_chunk_job(count($chunks), "term_remove:{$taxonomy}:{$term_id}");
+		foreach ($chunks as $chunk) {
 			$this->enqueue_async(self::AS_PROCESS_PRODUCTS, ['product_ids'=>$chunk, 'reason'=>"term_remove:{$taxonomy}:{$term_id}"], 'lpmd');
 		}
 	}
@@ -853,6 +978,9 @@ final class LPMD_Mass_Discounts {
 		if (!empty($errors)) {
 			$this->stats_set('last_errors', array_slice($errors, 0, 10));
 			$this->log('Batch errors', ['errors'=>array_slice($errors, 0, 10), 'reason'=>$reason]);
+			$this->stats_record_chunk_result('failed');
+		} else {
+			$this->stats_record_chunk_result('completed');
 		}
 		$this->log('Processed product batch', ['count'=>$processed, 'duration_ms'=>$dur_ms, 'reason'=>$reason]);
 	}
