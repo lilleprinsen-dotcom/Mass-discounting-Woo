@@ -179,8 +179,24 @@ final class LPMD_Mass_Discounts {
 		$this->stats_set('completed_chunks', 0);
 		$this->stats_set('failed_chunks', 0);
 		$this->stats_set('chunks_started_at', $this->now_ts());
-		$this->stats_set('chunk_job_reason', sanitize_text_field((string)$reason));
+		$normalized_reason = sanitize_text_field((string)$reason);
+		$this->stats_set('chunk_job_reason', $normalized_reason);
 		$this->stats_set('chunk_eta_seconds', null);
+		$this->stats_set('current_job_affected_products', []);
+		$this->stats_set('current_job_reason', $normalized_reason);
+	}
+
+	private function stats_track_affected_products($product_ids) {
+		if (!is_array($product_ids) || empty($product_ids)) return;
+
+		$stats = $this->stats_get_all();
+		$existing = isset($stats['current_job_affected_products']) && is_array($stats['current_job_affected_products'])
+			? $stats['current_job_affected_products']
+			: [];
+
+		$merged = array_values(array_unique(array_map('intval', array_merge($existing, $product_ids))));
+		$merged = array_slice($merged, 0, 300);
+		$this->stats_set('current_job_affected_products', $merged);
 	}
 
 	private function stats_record_chunk_result($status = 'completed') {
@@ -205,6 +221,8 @@ final class LPMD_Mass_Discounts {
 		if ($total > 0 && $done >= $total) {
 			$this->stats_set('chunk_eta_seconds', 0);
 			$this->stats_set('chunks_finished_at', $this->now_ts());
+			$this->stats_set('last_finished_job_reason', (string)($stats['current_job_reason'] ?? ($stats['chunk_job_reason'] ?? '')));
+			$this->stats_set('last_finished_job_affected_products', isset($stats['current_job_affected_products']) && is_array($stats['current_job_affected_products']) ? $stats['current_job_affected_products'] : []);
 		}
 	}
 
@@ -535,6 +553,10 @@ final class LPMD_Mass_Discounts {
 		if (!is_array($log)) $log = [];
 		$stats = $this->stats_get_all();
 		$progress = $this->get_jobs_progress_payload();
+		$last_affected = isset($stats['last_finished_job_affected_products']) && is_array($stats['last_finished_job_affected_products'])
+			? array_values(array_unique(array_map('intval', $stats['last_finished_job_affected_products'])))
+			: [];
+		$last_reason = (string)($stats['last_finished_job_reason'] ?? '');
 
 		echo '<h2>Status</h2>';
 		echo '<ul>';
@@ -550,6 +572,30 @@ final class LPMD_Mass_Discounts {
 		echo '<div style="height:18px;background:#f0f0f1;border-radius:9px;overflow:hidden;">';
 		echo '<div id="lpmd-progress-bar" style="height:18px;width:'.(int)$progress['progress_percent'].'%;background:#2271b1;transition:width .25s;"></div>';
 		echo '</div>';
+
+		echo '<h2>Last finished job: affected products</h2>';
+		if (!empty($last_affected)) {
+			echo '<p><strong>Reason:</strong> '.esc_html($last_reason !== '' ? $last_reason : 'unknown').'<br />';
+			echo '<strong>Total affected products:</strong> '.(int)count($last_affected).'</p>';
+			echo '<ul style="max-height:260px;overflow:auto;background:#fff;border:1px solid #dcdcde;padding:10px 16px;">';
+			foreach (array_slice($last_affected, 0, 100) as $pid) {
+				$title = get_the_title($pid);
+				$edit_url = get_edit_post_link($pid, '');
+				echo '<li>';
+				if ($edit_url) {
+					echo '<a href="'.esc_url($edit_url).'" target="_blank" rel="noopener noreferrer">#'.(int)$pid.' '.esc_html($title ?: '(no title)').'</a>';
+				} else {
+					echo '#'.(int)$pid.' '.esc_html($title ?: '(no title)');
+				}
+				echo '</li>';
+			}
+			echo '</ul>';
+			if (count($last_affected) > 100) {
+				echo '<p><em>Showing first 100 products.</em></p>';
+			}
+		} else {
+			echo '<p>No affected products recorded yet.</p>';
+		}
 		echo '<p id="lpmd-progress-text" style="margin-top:8px;">'.esc_html(sprintf(
 			'%d%% (%d/%d chunks, failed: %d, ETA: %s)',
 			(int)$progress['progress_percent'],
@@ -931,6 +977,7 @@ final class LPMD_Mass_Discounts {
 
 		$processed = 0;
 		$errors = [];
+		$affected_products = [];
 
 		// Cache active rules by taxonomy+term_id for this run
 		$active_rule_cache = [];
@@ -952,6 +999,7 @@ final class LPMD_Mass_Discounts {
 
 					foreach ($variation_ids as $vid) {
 						$changed = $this->apply_best_discount_to_item((int)$vid, $pid, $active_rule_cache, $override_other, $min_price);
+						if ($changed) $affected_products[] = $pid;
 						$needs_parent_reindex = $needs_parent_reindex || $changed;
 					}
 
@@ -967,6 +1015,7 @@ final class LPMD_Mass_Discounts {
 					}
 				} else {
 					$changed = $this->apply_best_discount_to_item($pid, 0, $active_rule_cache, $override_other, $min_price);
+					if ($changed) $affected_products[] = $pid;
 					if ($changed && function_exists('wc_delete_product_transients')) {
 						wc_delete_product_transients($pid);
 					}
@@ -982,6 +1031,7 @@ final class LPMD_Mass_Discounts {
 		}
 
 		$dur_ms = (int) round((microtime(true) - $start) * 1000);
+		$this->stats_track_affected_products($affected_products);
 		$this->stats_set('last_batch_run', date_i18n('Y-m-d H:i:s', $this->now_ts()));
 		$this->stats_set('last_batch_processed', $processed);
 		if (!empty($errors)) {
