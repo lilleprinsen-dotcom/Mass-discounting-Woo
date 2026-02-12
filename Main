@@ -943,27 +943,36 @@ final class LPMD_Mass_Discounts {
 				$product = wc_get_product($pid);
 				if (!$product) continue;
 
+				$needs_parent_reindex = false;
+
 				// For variable products: apply per variation and sync parent
 				if ($product->is_type('variable')) {
 					$variation_ids = $product->get_children();
 					$parent_id = $product->get_id();
 
 					foreach ($variation_ids as $vid) {
-						$this->apply_best_discount_to_item((int)$vid, $pid, $active_rule_cache, $override_other, $min_price);
+						$changed = $this->apply_best_discount_to_item((int)$vid, $pid, $active_rule_cache, $override_other, $min_price);
+						$needs_parent_reindex = $needs_parent_reindex || $changed;
 					}
 
 					// Sync variable pricing
-					if (class_exists('WC_Product_Variable')) {
+					if ($needs_parent_reindex && class_exists('WC_Product_Variable')) {
 						WC_Product_Variable::sync($parent_id);
 					}
-					if (function_exists('wc_delete_product_transients')) {
+					if ($needs_parent_reindex && function_exists('wc_delete_product_transients')) {
 						wc_delete_product_transients($parent_id);
 					}
-					if (function_exists('wc_update_product_lookup_tables')) {
+					if ($needs_parent_reindex && function_exists('wc_update_product_lookup_tables')) {
 						wc_update_product_lookup_tables($parent_id);
 					}
 				} else {
-					$this->apply_best_discount_to_item($pid, 0, $active_rule_cache, $override_other, $min_price);
+					$changed = $this->apply_best_discount_to_item($pid, 0, $active_rule_cache, $override_other, $min_price);
+					if ($changed && function_exists('wc_delete_product_transients')) {
+						wc_delete_product_transients($pid);
+					}
+					if ($changed && function_exists('wc_update_product_lookup_tables')) {
+						wc_update_product_lookup_tables($pid);
+					}
 				}
 
 				$processed++;
@@ -988,12 +997,12 @@ final class LPMD_Mass_Discounts {
 	private function apply_best_discount_to_item($item_id, $parent_product_id, &$active_rule_cache, $override_other_sales, $min_price_floor) {
 		$item_id = (int)$item_id;
 		$item = wc_get_product($item_id);
-		if (!$item) return;
+		if (!$item) return false;
 
 		// Only apply to items with a regular price
 		$regular = $item->get_regular_price();
 		if ($regular === '' || !is_numeric($regular)) {
-			return;
+			return false;
 		}
 		$regular = (float)$regular;
 
@@ -1007,17 +1016,9 @@ final class LPMD_Mass_Discounts {
 			}
 			$new_sale = max(0.0, $new_sale);
 
-			$this->persist_sale_price($item_id, $new_sale, $best['rule'], $override_other_sales);
+			return $this->persist_sale_price($item_id, $new_sale, $best['rule'], $override_other_sales);
 		} else {
-			$this->remove_if_ours($item_id);
-		}
-
-		// Clear transients + update lookup tables
-		if (function_exists('wc_delete_product_transients')) {
-			wc_delete_product_transients($item_id);
-		}
-		if (function_exists('wc_update_product_lookup_tables')) {
-			wc_update_product_lookup_tables($item_id);
+			return $this->remove_if_ours($item_id);
 		}
 	}
 
@@ -1108,10 +1109,19 @@ final class LPMD_Mass_Discounts {
 		$applied_json = get_post_meta($item_id, self::PMETA_APPLIED_RULE, true);
 		$applied = $applied_json ? json_decode($applied_json, true) : null;
 		$is_ours = (is_array($applied) && isset($applied['type'], $applied['term_id']));
+		$normalized_rule_ref = [
+			'type'    => (string)($rule_ref['type'] ?? ''),
+			'term_id' => (int)($rule_ref['term_id'] ?? 0),
+		];
 
 		// If product has a sale price from someone else and we don't override, skip
 		if (!$is_ours && $existing_sale !== '' && !$override_other_sales) {
-			return;
+			return false;
+		}
+
+		// Nothing changed; avoid expensive writes and lookup table rebuilds.
+		if ($is_ours && $existing_sale === $new_sale && $applied === $normalized_rule_ref) {
+			return false;
 		}
 
 		// If not ours and overriding, snapshot previous sale price once
@@ -1124,9 +1134,11 @@ final class LPMD_Mass_Discounts {
 		update_post_meta($item_id, '_price', $new_sale);
 
 		// Attribution
-		update_post_meta($item_id, self::PMETA_APPLIED_RULE, wp_json_encode($rule_ref));
+		update_post_meta($item_id, self::PMETA_APPLIED_RULE, wp_json_encode($normalized_rule_ref));
 		update_post_meta($item_id, self::PMETA_APPLIED_AT, date_i18n('Y-m-d H:i:s', $this->now_ts()));
 		update_post_meta($item_id, self::PMETA_APPLIED_PRICE, $new_sale);
+
+		return true;
 	}
 
 	private function remove_if_ours($item_id) {
@@ -1135,7 +1147,7 @@ final class LPMD_Mass_Discounts {
 		$applied_json = get_post_meta($item_id, self::PMETA_APPLIED_RULE, true);
 		$applied = $applied_json ? json_decode($applied_json, true) : null;
 		$is_ours = (is_array($applied) && isset($applied['type'], $applied['term_id']));
-		if (!$is_ours) return;
+		if (!$is_ours) return false;
 
 		$prev = get_post_meta($item_id, self::PMETA_PREV_SALE, true);
 
@@ -1161,12 +1173,7 @@ final class LPMD_Mass_Discounts {
 		delete_post_meta($item_id, self::PMETA_APPLIED_AT);
 		delete_post_meta($item_id, self::PMETA_APPLIED_PRICE);
 
-		if (function_exists('wc_delete_product_transients')) {
-			wc_delete_product_transients($item_id);
-		}
-		if (function_exists('wc_update_product_lookup_tables')) {
-			wc_update_product_lookup_tables($item_id);
-		}
+		return true;
 	}
 }
 
