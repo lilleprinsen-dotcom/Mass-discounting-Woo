@@ -72,6 +72,10 @@ final class LPMD_Mass_Discounts {
 		add_action('added_term_relationship', [$this, 'on_term_relationship_change'], 10, 3);
 		add_action('deleted_term_relationship', [$this, 'on_term_relationship_change'], 10, 3);
 
+		// Stock status watchers (re-check discounts when items come back in stock)
+		add_action('woocommerce_product_set_stock_status', [$this, 'on_product_stock_status_change'], 10, 3);
+		add_action('woocommerce_variation_set_stock_status', [$this, 'on_variation_stock_status_change'], 10, 3);
+
 		// Scheduled processing (Action Scheduler or WP-Cron fallback)
 		add_action(self::AS_PROCESS_DIRTY, [$this, 'handle_dirty_queue']);
 		add_action(self::AS_PROCESS_PRODUCTS, [$this, 'handle_product_batch'], 10, 1);
@@ -884,6 +888,30 @@ final class LPMD_Mass_Discounts {
 		$this->enqueue_dirty_processor('term_change');
 	}
 
+	public function on_product_stock_status_change($product_id, $stock_status, $product = null) {
+		if ((int)$product_id <= 0 || get_post_type($product_id) !== 'product') return;
+
+		// Prioritize restocks. Other status changes can still be ignored to save resources.
+		if ($stock_status !== 'instock') return;
+
+		$this->queue_dirty_product((int)$product_id);
+		$this->enqueue_dirty_processor('stock_change');
+	}
+
+	public function on_variation_stock_status_change($variation_id, $stock_status, $variation = null) {
+		$variation_id = (int)$variation_id;
+		if ($variation_id <= 0) return;
+
+		$parent_id = (int) wp_get_post_parent_id($variation_id);
+		if ($parent_id <= 0 || get_post_type($parent_id) !== 'product') return;
+
+		// Recompute parent only when variation is back in stock.
+		if ($stock_status !== 'instock') return;
+
+		$this->queue_dirty_product($parent_id);
+		$this->enqueue_dirty_processor('stock_change');
+	}
+
 	private function queue_dirty_product($product_id) {
 		$queue = get_option(self::OPT_DIRTY_QUEUE, []);
 		if (!is_array($queue)) $queue = [];
@@ -1114,6 +1142,9 @@ final class LPMD_Mass_Discounts {
 					$parent_id = $product->get_id();
 
 					foreach ($variation_ids as $vid) {
+						$variation = wc_get_product((int)$vid);
+						if (!$variation || !$variation->is_in_stock()) continue;
+
 						$changed = $this->apply_best_discount_to_item((int)$vid, $pid, $active_rule_cache, $override_other, $min_price);
 						if ($changed) $affected_products[] = $pid;
 						$needs_parent_reindex = $needs_parent_reindex || $changed;
@@ -1130,6 +1161,11 @@ final class LPMD_Mass_Discounts {
 						$this->refresh_product_lookup_row($parent_id);
 					}
 				} else {
+					if (!$product->is_in_stock()) {
+						$processed++;
+						continue;
+					}
+
 					$changed = $this->apply_best_discount_to_item($pid, 0, $active_rule_cache, $override_other, $min_price);
 					if ($changed) $affected_products[] = $pid;
 					if ($changed && function_exists('wc_delete_product_transients')) {
