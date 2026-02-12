@@ -315,11 +315,11 @@ final class LPMD_Mass_Discounts {
 			'hide_empty' => false,
 			'number'     => $per_page,
 			'offset'     => $offset,
-			'search'     => $search ? '*'.$search.'*' : '',
+			'search'     => $search,
 		];
 		$terms = get_terms($args);
 
-		$total_terms = wp_count_terms(['taxonomy'=>$taxonomy, 'hide_empty'=>false, 'search'=>$search ? '*'.$search.'*' : '']);
+		$total_terms = wp_count_terms(['taxonomy'=>$taxonomy, 'hide_empty'=>false, 'search'=>$search]);
 		$total_pages = (int) ceil(max(1, (int)$total_terms) / $per_page);
 
 		$this->render_admin_header($title);
