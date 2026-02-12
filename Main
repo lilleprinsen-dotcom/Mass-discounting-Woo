@@ -97,6 +97,7 @@ final class LPMD_Mass_Discounts {
 			'batch_size'         => self::DEFAULT_BATCH_SIZE,
 			'override_other_sales' => 'yes', // yes|no
 			'min_price'          => '', // optional floor
+			'rounding_mode'      => 'none', // none|nearest_0_01|nearest_0_05|nearest_0_10|psychological_99
 			'brand_taxonomy'     => $this->detect_brand_taxonomy(), // auto-detect; can be overridden by filter
 		];
 
@@ -108,8 +109,52 @@ final class LPMD_Mass_Discounts {
 	private function get_settings() {
 		$settings = get_option(self::OPT_SETTINGS, []);
 		if (!is_array($settings)) $settings = [];
+		$settings['rounding_mode'] = $this->normalize_rounding_mode($settings['rounding_mode'] ?? 'none');
 		$settings['brand_taxonomy'] = apply_filters('lpmd_brand_taxonomy', $settings['brand_taxonomy'] ?? $this->detect_brand_taxonomy());
 		return $settings;
+	}
+
+	private function normalize_rounding_mode($mode) {
+		$mode = sanitize_key((string)$mode);
+		$allowed = ['none', 'nearest_0_01', 'nearest_0_05', 'nearest_0_10', 'psychological_99'];
+		return in_array($mode, $allowed, true) ? $mode : 'none';
+	}
+
+	private function get_rounding_mode_label($mode) {
+		$mode = $this->normalize_rounding_mode($mode);
+		$labels = [
+			'none'             => 'None',
+			'nearest_0_01'     => 'Nearest 0.01',
+			'nearest_0_05'     => 'Nearest 0.05',
+			'nearest_0_10'     => 'Nearest 0.10',
+			'psychological_99' => 'Psychological .99',
+		];
+		return $labels[$mode] ?? 'None';
+	}
+
+	private function apply_rounding_mode($price, $rounding_mode) {
+		$price = max(0.0, (float)$price);
+		$rounding_mode = $this->normalize_rounding_mode($rounding_mode);
+
+		if ($rounding_mode === 'nearest_0_01') {
+			return round($price / 0.01) * 0.01;
+		}
+		if ($rounding_mode === 'nearest_0_05') {
+			return round($price / 0.05) * 0.05;
+		}
+		if ($rounding_mode === 'nearest_0_10') {
+			return round($price / 0.10) * 0.10;
+		}
+		if ($rounding_mode === 'psychological_99') {
+			$base = floor($price);
+			$candidate = $base + 0.99;
+			if ($candidate > $price) {
+				$candidate = ($base - 1) + 0.99;
+			}
+			return max(0.0, $candidate);
+		}
+
+		return $price;
 	}
 
 	private function detect_brand_taxonomy() {
@@ -498,7 +543,7 @@ final class LPMD_Mass_Discounts {
 
 		echo '<hr>';
 		echo '<h2>Settings</h2>';
-		echo '<p><strong>Debounce:</strong> '.(int)$settings['debounce_seconds'].'s | <strong>Batch size:</strong> '.(int)$settings['batch_size'].' | <strong>Override other sales:</strong> '.esc_html($settings['override_other_sales']).'</p>';
+		echo '<p><strong>Debounce:</strong> '.(int)$settings['debounce_seconds'].'s | <strong>Batch size:</strong> '.(int)$settings['batch_size'].' | <strong>Override other sales:</strong> '.esc_html($settings['override_other_sales']).' | <strong>Rounding mode:</strong> '.esc_html($this->get_rounding_mode_label($settings['rounding_mode'] ?? 'none')).'</p>';
 		echo '<p><small>Dates are interpreted in WordPress site timezone. Use format: YYYY-MM-DD HH:MM:SS</small></p>';
 
 		$this->render_admin_footer();
@@ -533,6 +578,12 @@ final class LPMD_Mass_Discounts {
 				$this->enqueue_dirty_processor('manual');
 				echo '<div class="notice notice-success"><p>Queued dirty queue processing.</p></div>';
 			}
+			if ($act === 'save_settings') {
+				$settings = $this->get_settings();
+				$settings['rounding_mode'] = $this->normalize_rounding_mode($_POST['rounding_mode'] ?? 'none');
+				update_option(self::OPT_SETTINGS, $settings, false);
+				echo '<div class="notice notice-success"><p>Saved settings.</p></div>';
+			}
 			if ($act === 'clear_dirty') {
 				update_option(self::OPT_DIRTY_QUEUE, [], false);
 				update_option(self::OPT_DIRTY_SCHEDULED, 'no', false);
@@ -564,6 +615,7 @@ final class LPMD_Mass_Discounts {
 		echo '<li><strong>Debounce seconds:</strong> '.(int)$settings['debounce_seconds'].'</li>';
 		echo '<li><strong>Batch size:</strong> '.(int)$settings['batch_size'].'</li>';
 		echo '<li><strong>Override other sales:</strong> '.esc_html($settings['override_other_sales']).'</li>';
+		echo '<li><strong>Rounding mode:</strong> '.esc_html($this->get_rounding_mode_label($settings['rounding_mode'] ?? 'none')).'</li>';
 		echo '<li><strong>Brand taxonomy:</strong> '.esc_html($settings['brand_taxonomy']).'</li>';
 		echo '</ul>';
 
@@ -609,6 +661,13 @@ final class LPMD_Mass_Discounts {
 		echo '<h2>Controls</h2>';
 		echo '<form method="post">';
 		wp_nonce_field('lpmd_jobs', 'lpmd_jobs_nonce');
+		echo '<p><label for="lpmd-rounding-mode"><strong>Rounding mode:</strong></label> ';
+		echo '<select id="lpmd-rounding-mode" name="rounding_mode">';
+		foreach (['none', 'nearest_0_01', 'nearest_0_05', 'nearest_0_10', 'psychological_99'] as $mode) {
+			echo '<option value="'.esc_attr($mode).'" '.selected(($settings['rounding_mode'] ?? 'none'), $mode, false).'>'.esc_html($this->get_rounding_mode_label($mode)).'</option>';
+		}
+		echo '</select> ';
+		echo '<button class="button" name="jobs_action" value="save_settings">Save settings</button></p>';
 		echo '<button class="button button-primary" name="jobs_action" value="process_dirty_now">Process dirty queue now</button> ';
 		echo '<button class="button" name="jobs_action" value="clear_dirty">Clear dirty queue</button> ';
 		echo '<button class="button" name="jobs_action" value="clear_log">Clear log</button>';
@@ -1075,6 +1134,7 @@ final class LPMD_Mass_Discounts {
 	private function get_best_applicable_rule_for_item($item_id, $parent_product_id, $regular_price, &$active_rule_cache) {
 		$settings = $this->get_settings();
 		$brand_tax = $settings['brand_taxonomy'];
+		$rounding_mode = $this->normalize_rounding_mode($settings['rounding_mode'] ?? 'none');
 
 		// Use parent product terms for variations (more consistent)
 		$base_id = $parent_product_id ? (int)$parent_product_id : (int)$item_id;
@@ -1107,7 +1167,7 @@ final class LPMD_Mass_Discounts {
 			$rule = $active_rule_cache[$key];
 			if (!$rule) continue;
 
-			$sale = $this->compute_sale_price($regular_price, $rule['type'], $rule['amount']);
+			$sale = $this->compute_sale_price($regular_price, $rule['type'], $rule['amount'], $rounding_mode);
 			if ($sale === null) continue;
 
 			$entry = [
@@ -1135,18 +1195,22 @@ final class LPMD_Mass_Discounts {
 		return $best;
 	}
 
-	private function compute_sale_price($regular, $type, $amount) {
+	private function compute_sale_price($regular, $type, $amount, $rounding_mode = 'none') {
 		$regular = (float)$regular;
 		$amount = (float)$amount;
 		if ($regular <= 0) return null;
 		if ($amount <= 0) return null;
 
+		$sale = null;
 		if ($type === 'fixed') {
-			return max(0.0, $regular - $amount);
+			$sale = max(0.0, $regular - $amount);
+		} else {
+			// percent
+			$p = min(100.0, max(0.0, $amount));
+			$sale = max(0.0, $regular * (1.0 - ($p / 100.0)));
 		}
-		// percent
-		$p = min(100.0, max(0.0, $amount));
-		return max(0.0, $regular * (1.0 - ($p / 100.0)));
+
+		return $this->apply_rounding_mode($sale, $rounding_mode);
 	}
 
 	private function persist_sale_price($item_id, $new_sale, $rule_ref, $override_other_sales) {
