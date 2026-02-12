@@ -172,37 +172,46 @@ final class LPMD_Mass_Discounts {
 	public function admin_menu() {
 		if (!current_user_can('manage_woocommerce')) return;
 
+		add_menu_page(
+			'LPMD Discounts',
+			'Product Discounts',
+			'manage_woocommerce',
+			'lpmd-main',
+			[$this, 'render_page_category'],
+			'dashicons-tickets-alt'
+		);
+
 		add_submenu_page(
-			'woocommerce',
+			'lpmd-main',
 			'Discounts - Categories',
-			'Discounts',
+			'Categories',
 			'manage_woocommerce',
 			'lpmd-category-discounts',
 			[$this, 'render_page_category']
 		);
 
 		add_submenu_page(
-			'woocommerce',
+			'lpmd-main',
 			'Discounts - Brands',
-			'Brands discounts',
+			'Brands',
 			'manage_woocommerce',
 			'lpmd-brand-discounts',
 			[$this, 'render_page_brand']
 		);
 
 		add_submenu_page(
-			'woocommerce',
+			'lpmd-main',
 			'Discounts - Tags',
-			'Tags discounts',
+			'Tags',
 			'manage_woocommerce',
 			'lpmd-tag-discounts',
 			[$this, 'render_page_tag']
 		);
 
 		add_submenu_page(
-			'woocommerce',
+			'lpmd-main',
 			'Discount Jobs & Performance',
-			'Discount jobs',
+			'Jobs',
 			'manage_woocommerce',
 			'lpmd-discount-jobs',
 			[$this, 'render_page_jobs']
