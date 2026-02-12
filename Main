@@ -1126,8 +1126,8 @@ final class LPMD_Mass_Discounts {
 					if ($needs_parent_reindex && function_exists('wc_delete_product_transients')) {
 						wc_delete_product_transients($parent_id);
 					}
-					if ($needs_parent_reindex && function_exists('wc_update_product_lookup_tables')) {
-						wc_update_product_lookup_tables($parent_id);
+					if ($needs_parent_reindex) {
+						$this->refresh_product_lookup_row($parent_id);
 					}
 				} else {
 					$changed = $this->apply_best_discount_to_item($pid, 0, $active_rule_cache, $override_other, $min_price);
@@ -1135,8 +1135,8 @@ final class LPMD_Mass_Discounts {
 					if ($changed && function_exists('wc_delete_product_transients')) {
 						wc_delete_product_transients($pid);
 					}
-					if ($changed && function_exists('wc_update_product_lookup_tables')) {
-						wc_update_product_lookup_tables($pid);
+					if ($changed) {
+						$this->refresh_product_lookup_row($pid);
 					}
 				}
 
@@ -1158,6 +1158,19 @@ final class LPMD_Mass_Discounts {
 			$this->stats_record_chunk_result('completed');
 		}
 		$this->log('Processed product batch', ['count'=>$processed, 'duration_ms'=>$dur_ms, 'reason'=>$reason]);
+	}
+
+	private function refresh_product_lookup_row($product_id) {
+		$product_id = (int)$product_id;
+		if ($product_id <= 0 || !class_exists('WC_Data_Store')) return;
+
+		try {
+			$data_store = WC_Data_Store::load('product');
+			if (!$data_store || !method_exists($data_store, 'update_lookup_table')) return;
+			$data_store->update_lookup_table($product_id, 'wc_product_meta_lookup');
+		} catch (Throwable $e) {
+			$this->log('Lookup row refresh failed', ['product_id' => $product_id, 'error' => $e->getMessage()]);
+		}
 	}
 
 	private function apply_best_discount_to_item($item_id, $parent_product_id, &$active_rule_cache, $override_other_sales, $min_price_floor) {
