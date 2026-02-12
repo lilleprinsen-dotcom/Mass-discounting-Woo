@@ -350,10 +350,37 @@ final class LPMD_Mass_Discounts {
 	private function render_admin_header($title) {
 		echo '<div class="wrap"><h1>'.esc_html($title).'</h1>';
 		echo '<p><strong>Server time:</strong> '.esc_html(date_i18n('Y-m-d H:i:s', $this->now_ts())).'</p>';
+		$this->render_admin_styles();
 	}
 
 	private function render_admin_footer() {
 		echo '</div>';
+	}
+
+	private function render_admin_styles() {
+		echo '<style>
+		.lpmd-help{background:#fff;border:1px solid #dcdcde;border-left:4px solid #2271b1;padding:12px 14px;margin:12px 0 16px;max-width:1100px;}
+		.lpmd-help p{margin:0 0 8px;}
+		.lpmd-help p:last-child{margin-bottom:0;}
+		.lpmd-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;max-width:1100px;margin:12px 0 16px;}
+		.lpmd-card{background:#fff;border:1px solid #dcdcde;border-radius:6px;padding:12px;}
+		.lpmd-card .k{display:block;font-size:12px;color:#50575e;text-transform:uppercase;letter-spacing:.03em;}
+		.lpmd-card .v{display:block;margin-top:6px;font-size:22px;font-weight:600;line-height:1.2;}
+		.lpmd-table-wrap{overflow-x:auto;max-width:100%;}
+		.lpmd-responsive-table{min-width:980px;}
+		.lpmd-status-pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;}
+		.lpmd-status-active{background:#edfaef;color:#116329;}
+		.lpmd-status-inactive{background:#f6f7f7;color:#50575e;}
+		.lpmd-button-group{display:flex;flex-wrap:wrap;gap:6px;}
+		#lpmd-progress-wrap{max-width:900px;}
+		@media (max-width: 900px){
+			.lpmd-responsive-table{min-width:0;}
+			.lpmd-responsive-table thead{display:none;}
+			.lpmd-responsive-table tbody tr{display:block;border:1px solid #dcdcde;border-radius:8px;margin-bottom:12px;background:#fff;padding:8px;}
+			.lpmd-responsive-table tbody td{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;border:0 !important;padding:8px 6px;}
+			.lpmd-responsive-table tbody td::before{content:attr(data-label);font-weight:600;color:#50575e;min-width:120px;}
+		}
+		</style>';
 	}
 
 	private function get_rule_for_term($taxonomy, $term_id) {
@@ -462,13 +489,15 @@ final class LPMD_Mass_Discounts {
 
 		$this->render_admin_header($title);
 
-		echo '<form method="get" style="margin:10px 0;">';
+		echo '<div class="lpmd-help"><p><strong>How to use this page:</strong> enable a rule, set discount type + amount, optionally schedule dates, then click <em>Save</em>. Use <em>Queue apply</em> to recalculate prices now or <em>Queue remove</em> to remove this rule from matching products.</p><p><strong>Date format:</strong> YYYY-MM-DD HH:MM:SS in your WordPress site timezone.</p></div>';
+		echo '<form method="get" style="margin:10px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">';
 		echo '<input type="hidden" name="page" value="'.esc_attr($page_slug).'" />';
 		echo '<input type="search" name="s" value="'.esc_attr($search).'" placeholder="Search term..." />';
 		submit_button('Search', 'secondary', '', false);
 		echo '</form>';
 
-		echo '<table class="widefat striped">';
+		echo '<div class="lpmd-table-wrap">';
+		echo '<table class="widefat striped lpmd-responsive-table">';
 		echo '<thead><tr>';
 		echo '<th>Term</th>';
 		echo '<th>Discount type</th>';
@@ -486,10 +515,10 @@ final class LPMD_Mass_Discounts {
 				$is_active = $this->is_rule_active_now($rule);
 
 				echo '<tr>';
-				echo '<td><strong>'.esc_html($term->name).'</strong><br><small>'.esc_html($taxonomy).' #'.(int)$term->term_id.'</small></td>';
+				echo '<td data-label="Term"><strong>'.esc_html($term->name).'</strong><br><small>'.esc_html($taxonomy).' #'.(int)$term->term_id.'</small></td>';
 
-				echo '<td>';
-				echo '<form method="post">';
+				echo '<td data-label="Discount type">';
+				echo '<form method="post" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">';
 				wp_nonce_field('lpmd_save_rules', 'lpmd_nonce');
 				echo '<input type="hidden" name="term_id" value="'.(int)$term->term_id.'"/>';
 				echo '<select name="discount_type">';
@@ -498,22 +527,24 @@ final class LPMD_Mass_Discounts {
 				echo '</select>';
 				echo '</td>';
 
-				echo '<td><input type="text" name="amount" value="'.esc_attr((string)$rule['amount']).'" style="width:90px;" /></td>';
+				echo '<td data-label="Amount"><input type="text" name="amount" value="'.esc_attr((string)$rule['amount']).'" style="width:90px;" /></td>';
 
-				echo '<td>';
+				echo '<td data-label="Apply">';
 				echo '<label><input type="checkbox" name="enabled" value="1" '.checked($rule['enabled'], true, false).' /> Enabled</label>';
-				echo $is_active ? '<br><small style="color:green;">Active now</small>' : '<br><small style="color:#666;">Not active</small>';
+				echo $is_active ? '<br><span class="lpmd-status-pill lpmd-status-active">Active now</span>' : '<br><span class="lpmd-status-pill lpmd-status-inactive">Not active</span>';
 				echo '</td>';
 
-				echo '<td><label><input type="checkbox" name="sched_enabled" value="1" '.checked($rule['sched_enabled'], true, false).' /> Scheduled</label></td>';
+				echo '<td data-label="Schedule"><label><input type="checkbox" name="sched_enabled" value="1" '.checked($rule['sched_enabled'], true, false).' /> Scheduled</label></td>';
 
-				echo '<td><input type="text" name="from_dt" value="'.esc_attr($rule['from']).'" placeholder="YYYY-MM-DD HH:MM:SS" style="width:170px;" /></td>';
-				echo '<td><input type="text" name="to_dt" value="'.esc_attr($rule['to']).'" placeholder="YYYY-MM-DD HH:MM:SS" style="width:170px;" /></td>';
+				echo '<td data-label="From date"><input type="text" name="from_dt" value="'.esc_attr($rule['from']).'" placeholder="YYYY-MM-DD HH:MM:SS" style="width:170px;" /></td>';
+				echo '<td data-label="To date"><input type="text" name="to_dt" value="'.esc_attr($rule['to']).'" placeholder="YYYY-MM-DD HH:MM:SS" style="width:170px;" /></td>';
 
-				echo '<td>';
+				echo '<td data-label="Actions">';
+				echo '<div class="lpmd-button-group">';
 				echo '<button class="button button-primary" type="submit" name="lpmd_action" value="save_only">Save</button> ';
 				echo '<button class="button" type="submit" name="lpmd_action" value="queue_apply">Queue apply</button> ';
 				echo '<button class="button" type="submit" name="lpmd_action" value="queue_remove">Queue remove</button>';
+				echo '</div>';
 				echo '</form>';
 				echo '</td>';
 
@@ -524,6 +555,7 @@ final class LPMD_Mass_Discounts {
 		}
 
 		echo '</tbody></table>';
+		echo '</div>';
 
 		// Pagination
 		if ($total_pages > 1) {
@@ -540,6 +572,25 @@ final class LPMD_Mass_Discounts {
 			}
 			echo '</div>';
 		}
+
+		$active_on_page = 0;
+		$enabled_on_page = 0;
+		$scheduled_on_page = 0;
+		if (!is_wp_error($terms) && !empty($terms)) {
+			foreach ($terms as $term_for_stats) {
+				$rule_for_stats = $this->get_rule_for_term($taxonomy, $term_for_stats->term_id);
+				if (!empty($rule_for_stats['enabled'])) $enabled_on_page++;
+				if (!empty($rule_for_stats['sched_enabled'])) $scheduled_on_page++;
+				if ($this->is_rule_active_now($rule_for_stats)) $active_on_page++;
+			}
+		}
+
+		echo '<div class="lpmd-grid">';
+		echo '<div class="lpmd-card"><span class="k">Terms (all)</span><span class="v">'.(int)$total_terms.'</span></div>';
+		echo '<div class="lpmd-card"><span class="k">Enabled rules (this page)</span><span class="v">'.(int)$enabled_on_page.'</span></div>';
+		echo '<div class="lpmd-card"><span class="k">Active now (this page)</span><span class="v">'.(int)$active_on_page.'</span></div>';
+		echo '<div class="lpmd-card"><span class="k">Scheduled rules (this page)</span><span class="v">'.(int)$scheduled_on_page.'</span></div>';
+		echo '</div>';
 
 		echo '<hr>';
 		echo '<h2>Settings</h2>';
@@ -609,9 +660,15 @@ final class LPMD_Mass_Discounts {
 			: [];
 		$last_reason = (string)($stats['last_finished_job_reason'] ?? '');
 
+		echo '<div class="lpmd-help"><p><strong>What this page tells you:</strong> current queue load, progress of running chunk jobs, latest affected products, and recent execution logs.</p><p><strong>Tip:</strong> use <em>Process dirty queue now</em> after changing many rules to speed up recalculation.</p></div>';
 		echo '<h2>Status</h2>';
+		echo '<div class="lpmd-grid">';
+		echo '<div class="lpmd-card"><span class="k">Dirty queue</span><span class="v">'.(int)count($queue).'</span></div>';
+		echo '<div class="lpmd-card"><span class="k">Chunk progress</span><span class="v">'.(int)$progress['progress_percent'].'%</span></div>';
+		echo '<div class="lpmd-card"><span class="k">Processed chunks</span><span class="v">'.(int)$progress['processed_chunks'].' / '.(int)$progress['total_chunks'].'</span></div>';
+		echo '<div class="lpmd-card"><span class="k">Failed chunks</span><span class="v">'.(int)$progress['failed_chunks'].'</span></div>';
+		echo '</div>';
 		echo '<ul>';
-		echo '<li><strong>Dirty queue size:</strong> '.(int)count($queue).'</li>';
 		echo '<li><strong>Debounce seconds:</strong> '.(int)$settings['debounce_seconds'].'</li>';
 		echo '<li><strong>Batch size:</strong> '.(int)$settings['batch_size'].'</li>';
 		echo '<li><strong>Override other sales:</strong> '.esc_html($settings['override_other_sales']).'</li>';
@@ -659,7 +716,7 @@ final class LPMD_Mass_Discounts {
 		echo '</div>';
 
 		echo '<h2>Controls</h2>';
-		echo '<form method="post">';
+		echo '<form method="post" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">';
 		wp_nonce_field('lpmd_jobs', 'lpmd_jobs_nonce');
 		echo '<p><label for="lpmd-rounding-mode"><strong>Rounding mode:</strong></label> ';
 		echo '<select id="lpmd-rounding-mode" name="rounding_mode">';
