@@ -1,0 +1,989 @@
+<?php
+/**
+ * Plugin Name: Lilleprinsen Mass Discounts (Category/Brand/Tag) - Persisted Prices + Scheduling
+ * Description: Mass discount rules for categories, brands and tags with best-discount collision handling, persisted DB prices for feeds, Action Scheduler batching, and debounced auto-updates when products change terms.
+ * Version: 1.0.0
+ * Author: ChatGPT
+ *
+ * INSTALL:
+ * - Save this as: wp-content/plugins/lp-mass-discounts/lp-mass-discounts.php
+ * - Activate in WP Admin → Plugins
+ *
+ * NOTES:
+ * - Uses WooCommerce Action Scheduler when available (WooCommerce includes it). Falls back to WP-Cron if not.
+ * - Updates _sale_price and _price on products/variations so feeds see the discounted prices.
+ */
+
+if (!defined('ABSPATH')) exit;
+
+final class LPMD_Mass_Discounts {
+	const OPT_DIRTY_QUEUE      = 'lpmd_dirty_queue_v1';
+	const OPT_DIRTY_SCHEDULED  = 'lpmd_dirty_scheduled_v1';
+	const OPT_SETTINGS         = 'lpmd_settings_v1';
+	const OPT_LOG              = 'lpmd_log_v1';
+	const OPT_STATS            = 'lpmd_stats_v1';
+
+	const META_ENABLED         = 'lpmd_enabled';
+	const META_TYPE            = 'lpmd_discount_type'; // percent|fixed
+	const META_AMOUNT          = 'lpmd_amount';
+	const META_SCHED_ENABLED   = 'lpmd_sched_enabled';
+	const META_FROM            = 'lpmd_from'; // mysql datetime in site timezone
+	const META_TO              = 'lpmd_to';   // mysql datetime in site timezone
+
+	// Attribution metas (product/variation)
+	const PMETA_APPLIED_RULE   = '_lpmd_applied_rule'; // json: {type, term_id}
+	const PMETA_PREV_SALE      = '_lpmd_prev_sale_price';
+	const PMETA_APPLIED_AT     = '_lpmd_applied_at';
+	const PMETA_APPLIED_PRICE  = '_lpmd_applied_price';
+
+	// Action names
+	const AS_PROCESS_PRODUCTS  = 'lpmd_process_product_batch';
+	const AS_PROCESS_DIRTY     = 'lpmd_process_dirty_queue';
+	const AS_APPLY_TERM        = 'lpmd_apply_term_rule_now';
+	const AS_REMOVE_TERM       = 'lpmd_remove_term_rule_now';
+
+	// Default tuning
+	const DEFAULT_DEBOUNCE_SECONDS = 60;
+	const DEFAULT_BATCH_SIZE       = 120; // products per batch (variations handled inside)
+
+	private static $instance = null;
+
+	public static function instance() {
+		if (self::$instance === null) self::$instance = new self();
+		return self::$instance;
+	}
+
+	private function __construct() {
+		add_action('plugins_loaded', [$this, 'init']);
+	}
+
+	public function init() {
+		if (!class_exists('WooCommerce')) return;
+
+		// Settings
+		add_filter('woocommerce_get_settings_pages', [$this, 'noop']); // placeholder to avoid warnings in some envs
+		add_action('admin_init', [$this, 'ensure_settings_defaults']);
+
+		// Admin UI
+		add_action('admin_menu', [$this, 'admin_menu']);
+
+		// Term relationship watchers (auto-discount when product added/removed)
+		add_action('added_term_relationship', [$this, 'on_term_relationship_change'], 10, 3);
+		add_action('deleted_term_relationship', [$this, 'on_term_relationship_change'], 10, 3);
+
+		// Scheduled processing (Action Scheduler or WP-Cron fallback)
+		add_action(self::AS_PROCESS_DIRTY, [$this, 'handle_dirty_queue']);
+		add_action(self::AS_PROCESS_PRODUCTS, [$this, 'handle_product_batch'], 10, 1);
+		add_action(self::AS_APPLY_TERM, [$this, 'handle_apply_term_rule'], 10, 2);
+		add_action(self::AS_REMOVE_TERM, [$this, 'handle_remove_term_rule'], 10, 2);
+
+		// WP-Cron fallbacks
+		add_action(self::AS_PROCESS_DIRTY.'_cron', [$this, 'handle_dirty_queue']);
+		add_action(self::AS_PROCESS_PRODUCTS.'_cron', [$this, 'handle_product_batch'], 10, 1);
+		add_action(self::AS_APPLY_TERM.'_cron', [$this, 'handle_apply_term_rule'], 10, 2);
+		add_action(self::AS_REMOVE_TERM.'_cron', [$this, 'handle_remove_term_rule'], 10, 2);
+	}
+
+	public function noop($x){ return $x; }
+
+	/* ------------------------------------------------------------
+	 * Settings + helpers
+	 * ------------------------------------------------------------ */
+
+	public function ensure_settings_defaults() {
+		$defaults = [
+			'debounce_seconds'   => self::DEFAULT_DEBOUNCE_SECONDS,
+			'batch_size'         => self::DEFAULT_BATCH_SIZE,
+			'override_other_sales' => 'yes', // yes|no
+			'min_price'          => '', // optional floor
+			'brand_taxonomy'     => $this->detect_brand_taxonomy(), // auto-detect; can be overridden by filter
+		];
+
+		$settings = get_option(self::OPT_SETTINGS, []);
+		$merged = array_merge($defaults, is_array($settings) ? $settings : []);
+		update_option(self::OPT_SETTINGS, $merged, false);
+	}
+
+	private function get_settings() {
+		$settings = get_option(self::OPT_SETTINGS, []);
+		if (!is_array($settings)) $settings = [];
+		$settings['brand_taxonomy'] = apply_filters('lpmd_brand_taxonomy', $settings['brand_taxonomy'] ?? $this->detect_brand_taxonomy());
+		return $settings;
+	}
+
+	private function detect_brand_taxonomy() {
+		$candidates = [
+			'product_brands',      // common
+			'product_brand',       // common
+			'pwb-brand',           // Perfect WooCommerce Brands
+			'product_brands_tax',  // custom
+			'Product_Brands',      // user provided name (unlikely actual taxonomy slug, but included)
+		];
+		foreach ($candidates as $tax) {
+			if (taxonomy_exists($tax)) return $tax;
+		}
+		// If none exist yet, default to product_brand (admin can override via filter or editing option)
+		return 'product_brand';
+	}
+
+	private function now_ts() {
+		return (int) current_time('timestamp'); // site/server time (WP timezone)
+	}
+
+	private function dt_to_ts($mysql_dt) {
+		if (!$mysql_dt) return 0;
+		$ts = strtotime($mysql_dt);
+		return $ts ? (int)$ts : 0;
+	}
+
+	private function ts_to_mysql($ts) {
+		return gmdate('Y-m-d H:i:s', $ts + (get_option('gmt_offset') * HOUR_IN_SECONDS));
+	}
+
+	private function log($message, $context = []) {
+		$log = get_option(self::OPT_LOG, []);
+		if (!is_array($log)) $log = [];
+		$entry = [
+			'time' => date_i18n('Y-m-d H:i:s', $this->now_ts()),
+			'msg'  => (string)$message,
+			'ctx'  => $context,
+		];
+		array_unshift($log, $entry);
+		$log = array_slice($log, 0, 200);
+		update_option(self::OPT_LOG, $log, false);
+	}
+
+	private function stats_set($key, $value) {
+		$stats = get_option(self::OPT_STATS, []);
+		if (!is_array($stats)) $stats = [];
+		$stats[$key] = $value;
+		update_option(self::OPT_STATS, $stats, false);
+	}
+
+	private function stats_get_all() {
+		$stats = get_option(self::OPT_STATS, []);
+		return is_array($stats) ? $stats : [];
+	}
+
+	/* ------------------------------------------------------------
+	 * Admin menu + pages
+	 * ------------------------------------------------------------ */
+
+	public function admin_menu() {
+		if (!current_user_can('manage_woocommerce')) return;
+
+		add_submenu_page(
+			'woocommerce',
+			'Discounts - Categories',
+			'Discounts',
+			'manage_woocommerce',
+			'lpmd-category-discounts',
+			[$this, 'render_page_category']
+		);
+
+		add_submenu_page(
+			'woocommerce',
+			'Discounts - Brands',
+			'Brands discounts',
+			'manage_woocommerce',
+			'lpmd-brand-discounts',
+			[$this, 'render_page_brand']
+		);
+
+		add_submenu_page(
+			'woocommerce',
+			'Discounts - Tags',
+			'Tags discounts',
+			'manage_woocommerce',
+			'lpmd-tag-discounts',
+			[$this, 'render_page_tag']
+		);
+
+		add_submenu_page(
+			'woocommerce',
+			'Discount Jobs & Performance',
+			'Discount jobs',
+			'manage_woocommerce',
+			'lpmd-discount-jobs',
+			[$this, 'render_page_jobs']
+		);
+	}
+
+	private function render_admin_header($title) {
+		echo '<div class="wrap"><h1>'.esc_html($title).'</h1>';
+		echo '<p><strong>Server time:</strong> '.esc_html(date_i18n('Y-m-d H:i:s', $this->now_ts())).'</p>';
+	}
+
+	private function render_admin_footer() {
+		echo '</div>';
+	}
+
+	private function get_rule_for_term($taxonomy, $term_id) {
+		$enabled = (string) get_term_meta($term_id, self::META_ENABLED, true);
+		$type    = (string) get_term_meta($term_id, self::META_TYPE, true);
+		$amount  = (string) get_term_meta($term_id, self::META_AMOUNT, true);
+		$sen     = (string) get_term_meta($term_id, self::META_SCHED_ENABLED, true);
+		$from    = (string) get_term_meta($term_id, self::META_FROM, true);
+		$to      = (string) get_term_meta($term_id, self::META_TO, true);
+
+		return [
+			'taxonomy' => $taxonomy,
+			'term_id'  => (int)$term_id,
+			'enabled'  => ($enabled === 'yes'),
+			'type'     => in_array($type, ['percent','fixed'], true) ? $type : 'percent',
+			'amount'   => is_numeric($amount) ? (float)$amount : 0.0,
+			'sched_enabled' => ($sen === 'yes'),
+			'from'     => $from,
+			'to'       => $to,
+		];
+	}
+
+	private function is_rule_active_now($rule) {
+		if (empty($rule['enabled'])) return false;
+		if (empty($rule['sched_enabled'])) return true;
+
+		$now = $this->now_ts();
+		$from_ts = $this->dt_to_ts($rule['from']);
+		$to_ts   = $this->dt_to_ts($rule['to']);
+
+		if ($from_ts && $now < $from_ts) return false;
+		if ($to_ts && $now > $to_ts) return false;
+
+		// If schedule enabled but empty dates, treat as active (safer default)
+		return true;
+	}
+
+	private function save_rule_for_term($term_id, $payload) {
+		$enabled = !empty($payload['enabled']) ? 'yes' : 'no';
+		$type    = ($payload['type'] === 'fixed') ? 'fixed' : 'percent';
+		$amount  = is_numeric($payload['amount']) ? (string)$payload['amount'] : '0';
+		$sen     = !empty($payload['sched_enabled']) ? 'yes' : 'no';
+		$from    = !empty($payload['from']) ? sanitize_text_field($payload['from']) : '';
+		$to      = !empty($payload['to']) ? sanitize_text_field($payload['to']) : '';
+
+		update_term_meta($term_id, self::META_ENABLED, $enabled);
+		update_term_meta($term_id, self::META_TYPE, $type);
+		update_term_meta($term_id, self::META_AMOUNT, $amount);
+		update_term_meta($term_id, self::META_SCHED_ENABLED, $sen);
+		update_term_meta($term_id, self::META_FROM, $from);
+		update_term_meta($term_id, self::META_TO, $to);
+	}
+
+	private function render_rules_table($taxonomy, $title, $page_slug) {
+		if (!current_user_can('manage_woocommerce')) return;
+
+		$settings = $this->get_settings();
+		$search = isset($_GET['s']) ? sanitize_text_field(wp_unslash($_GET['s'])) : '';
+		$paged  = isset($_GET['paged']) ? max(1, (int)$_GET['paged']) : 1;
+		$per_page = 30;
+		$offset = ($paged - 1) * $per_page;
+
+		// Handle POST save
+		if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['lpmd_nonce']) && wp_verify_nonce(sanitize_text_field(wp_unslash($_POST['lpmd_nonce'])), 'lpmd_save_rules')) {
+			$term_id = isset($_POST['term_id']) ? (int) $_POST['term_id'] : 0;
+			$action  = isset($_POST['lpmd_action']) ? sanitize_text_field(wp_unslash($_POST['lpmd_action'])) : '';
+
+			if ($term_id > 0) {
+				$payload = [
+					'enabled'      => !empty($_POST['enabled']),
+					'type'         => isset($_POST['discount_type']) ? sanitize_text_field(wp_unslash($_POST['discount_type'])) : 'percent',
+					'amount'       => isset($_POST['amount']) ? sanitize_text_field(wp_unslash($_POST['amount'])) : '0',
+					'sched_enabled'=> !empty($_POST['sched_enabled']),
+					'from'         => isset($_POST['from_dt']) ? sanitize_text_field(wp_unslash($_POST['from_dt'])) : '',
+					'to'           => isset($_POST['to_dt']) ? sanitize_text_field(wp_unslash($_POST['to_dt'])) : '',
+				];
+				$this->save_rule_for_term($term_id, $payload);
+
+				$rule = $this->get_rule_for_term($taxonomy, $term_id);
+				$this->schedule_boundaries_for_term_rule($rule);
+
+				if ($action === 'queue_apply') {
+					$this->enqueue_apply_term_rule($taxonomy, $term_id, 'manual_apply');
+					$this->log("Queued apply for {$taxonomy} term {$term_id}", []);
+				} elseif ($action === 'queue_remove') {
+					$this->enqueue_remove_term_rule($taxonomy, $term_id, 'manual_remove');
+					$this->log("Queued remove for {$taxonomy} term {$term_id}", []);
+				}
+
+				echo '<div class="notice notice-success"><p>Saved. Jobs (if any) have been queued.</p></div>';
+			}
+		}
+
+		// Query terms
+		$args = [
+			'taxonomy'   => $taxonomy,
+			'hide_empty' => false,
+			'number'     => $per_page,
+			'offset'     => $offset,
+			'search'     => $search ? '*'.$search.'*' : '',
+		];
+		$terms = get_terms($args);
+
+		$total_terms = wp_count_terms(['taxonomy'=>$taxonomy, 'hide_empty'=>false, 'search'=>$search ? '*'.$search.'*' : '']);
+		$total_pages = (int) ceil(max(1, (int)$total_terms) / $per_page);
+
+		$this->render_admin_header($title);
+
+		echo '<form method="get" style="margin:10px 0;">';
+		echo '<input type="hidden" name="page" value="'.esc_attr($page_slug).'" />';
+		echo '<input type="search" name="s" value="'.esc_attr($search).'" placeholder="Search term..." />';
+		submit_button('Search', 'secondary', '', false);
+		echo '</form>';
+
+		echo '<table class="widefat striped">';
+		echo '<thead><tr>';
+		echo '<th>Term</th>';
+		echo '<th>Discount type</th>';
+		echo '<th>Amount(,-)</th>';
+		echo '<th>Apply</th>';
+		echo '<th>Schedule discount</th>';
+		echo '<th>From Date (Server Time)</th>';
+		echo '<th>To Date (Server Time)</th>';
+		echo '<th>Queue</th>';
+		echo '</tr></thead><tbody>';
+
+		if (!is_wp_error($terms) && !empty($terms)) {
+			foreach ($terms as $term) {
+				$rule = $this->get_rule_for_term($taxonomy, $term->term_id);
+				$is_active = $this->is_rule_active_now($rule);
+
+				echo '<tr>';
+				echo '<td><strong>'.esc_html($term->name).'</strong><br><small>'.esc_html($taxonomy).' #'.(int)$term->term_id.'</small></td>';
+
+				echo '<td>';
+				echo '<form method="post">';
+				wp_nonce_field('lpmd_save_rules', 'lpmd_nonce');
+				echo '<input type="hidden" name="term_id" value="'.(int)$term->term_id.'"/>';
+				echo '<select name="discount_type">';
+				echo '<option value="percent" '.selected($rule['type'], 'percent', false).'>Percent</option>';
+				echo '<option value="fixed" '.selected($rule['type'], 'fixed', false).'>Fixed</option>';
+				echo '</select>';
+				echo '</td>';
+
+				echo '<td><input type="text" name="amount" value="'.esc_attr((string)$rule['amount']).'" style="width:90px;" /></td>';
+
+				echo '<td>';
+				echo '<label><input type="checkbox" name="enabled" value="1" '.checked($rule['enabled'], true, false).' /> Enabled</label>';
+				echo $is_active ? '<br><small style="color:green;">Active now</small>' : '<br><small style="color:#666;">Not active</small>';
+				echo '</td>';
+
+				echo '<td><label><input type="checkbox" name="sched_enabled" value="1" '.checked($rule['sched_enabled'], true, false).' /> Scheduled</label></td>';
+
+				echo '<td><input type="text" name="from_dt" value="'.esc_attr($rule['from']).'" placeholder="YYYY-MM-DD HH:MM:SS" style="width:170px;" /></td>';
+				echo '<td><input type="text" name="to_dt" value="'.esc_attr($rule['to']).'" placeholder="YYYY-MM-DD HH:MM:SS" style="width:170px;" /></td>';
+
+				echo '<td>';
+				echo '<button class="button button-primary" type="submit" name="lpmd_action" value="save_only">Save</button> ';
+				echo '<button class="button" type="submit" name="lpmd_action" value="queue_apply">Queue apply</button> ';
+				echo '<button class="button" type="submit" name="lpmd_action" value="queue_remove">Queue remove</button>';
+				echo '</form>';
+				echo '</td>';
+
+				echo '</tr>';
+			}
+		} else {
+			echo '<tr><td colspan="8">No terms found.</td></tr>';
+		}
+
+		echo '</tbody></table>';
+
+		// Pagination
+		if ($total_pages > 1) {
+			$base_url = remove_query_arg(['paged'], menu_page_url($page_slug, false));
+			$base_url = add_query_arg(['s'=>$search], $base_url);
+
+			echo '<div style="margin-top:12px;">';
+			echo '<span>Page '.(int)$paged.' of '.(int)$total_pages.'</span> ';
+			if ($paged > 1) {
+				echo '<a class="button" href="'.esc_url(add_query_arg('paged', $paged-1, $base_url)).'">Prev</a> ';
+			}
+			if ($paged < $total_pages) {
+				echo '<a class="button" href="'.esc_url(add_query_arg('paged', $paged+1, $base_url)).'">Next</a>';
+			}
+			echo '</div>';
+		}
+
+		echo '<hr>';
+		echo '<h2>Settings</h2>';
+		echo '<p><strong>Debounce:</strong> '.(int)$settings['debounce_seconds'].'s | <strong>Batch size:</strong> '.(int)$settings['batch_size'].' | <strong>Override other sales:</strong> '.esc_html($settings['override_other_sales']).'</p>';
+		echo '<p><small>Dates are interpreted in WordPress site timezone. Use format: YYYY-MM-DD HH:MM:SS</small></p>';
+
+		$this->render_admin_footer();
+	}
+
+	public function render_page_category() {
+		$this->render_rules_table('product_cat', 'Category discounts', 'lpmd-category-discounts');
+	}
+
+	public function render_page_brand() {
+		$tax = $this->get_settings()['brand_taxonomy'];
+		if (!taxonomy_exists($tax)) {
+			$this->render_admin_header('Brand discounts');
+			echo '<div class="notice notice-warning"><p>Brand taxonomy not found. Detected taxonomy slug: <strong>'.esc_html($tax).'</strong>. If your brand taxonomy is different, add this to your theme/plugin:<br><code>add_filter(\'lpmd_brand_taxonomy\', fn() => \'your_tax_slug\');</code></p></div>';
+			$this->render_admin_footer();
+			return;
+		}
+		$this->render_rules_table($tax, 'Brand discounts', 'lpmd-brand-discounts');
+	}
+
+	public function render_page_tag() {
+		$this->render_rules_table('product_tag', 'Tag discounts', 'lpmd-tag-discounts');
+	}
+
+	public function render_page_jobs() {
+		if (!current_user_can('manage_woocommerce')) return;
+
+		// Manual actions
+		if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['lpmd_jobs_nonce']) && wp_verify_nonce(sanitize_text_field(wp_unslash($_POST['lpmd_jobs_nonce'])), 'lpmd_jobs')) {
+			$act = isset($_POST['jobs_action']) ? sanitize_text_field(wp_unslash($_POST['jobs_action'])) : '';
+			if ($act === 'process_dirty_now') {
+				$this->enqueue_dirty_processor('manual');
+				echo '<div class="notice notice-success"><p>Queued dirty queue processing.</p></div>';
+			}
+			if ($act === 'clear_dirty') {
+				update_option(self::OPT_DIRTY_QUEUE, [], false);
+				update_option(self::OPT_DIRTY_SCHEDULED, 'no', false);
+				echo '<div class="notice notice-success"><p>Cleared dirty queue.</p></div>';
+			}
+			if ($act === 'clear_log') {
+				update_option(self::OPT_LOG, [], false);
+				echo '<div class="notice notice-success"><p>Cleared log.</p></div>';
+			}
+		}
+
+		$this->render_admin_header('Discount jobs & performance');
+
+		$settings = $this->get_settings();
+		$queue = get_option(self::OPT_DIRTY_QUEUE, []);
+		if (!is_array($queue)) $queue = [];
+		$log = get_option(self::OPT_LOG, []);
+		if (!is_array($log)) $log = [];
+		$stats = $this->stats_get_all();
+
+		echo '<h2>Status</h2>';
+		echo '<ul>';
+		echo '<li><strong>Dirty queue size:</strong> '.(int)count($queue).'</li>';
+		echo '<li><strong>Debounce seconds:</strong> '.(int)$settings['debounce_seconds'].'</li>';
+		echo '<li><strong>Batch size:</strong> '.(int)$settings['batch_size'].'</li>';
+		echo '<li><strong>Override other sales:</strong> '.esc_html($settings['override_other_sales']).'</li>';
+		echo '<li><strong>Brand taxonomy:</strong> '.esc_html($settings['brand_taxonomy']).'</li>';
+		echo '</ul>';
+
+		echo '<h2>Controls</h2>';
+		echo '<form method="post">';
+		wp_nonce_field('lpmd_jobs', 'lpmd_jobs_nonce');
+		echo '<button class="button button-primary" name="jobs_action" value="process_dirty_now">Process dirty queue now</button> ';
+		echo '<button class="button" name="jobs_action" value="clear_dirty">Clear dirty queue</button> ';
+		echo '<button class="button" name="jobs_action" value="clear_log">Clear log</button>';
+		echo '</form>';
+
+		echo '<h2>Recent stats</h2>';
+		echo '<table class="widefat striped"><tbody>';
+		foreach (['last_dirty_run','last_dirty_processed','last_batch_run','last_batch_processed','last_errors'] as $k) {
+			echo '<tr><td style="width:240px;"><strong>'.esc_html($k).'</strong></td><td>'.esc_html(is_scalar($stats[$k] ?? '') ? (string)($stats[$k] ?? '') : wp_json_encode($stats[$k] ?? '')).'</td></tr>';
+		}
+		echo '</tbody></table>';
+
+		echo '<h2>Log (last 50)</h2>';
+		echo '<table class="widefat striped"><thead><tr><th style="width:170px;">Time</th><th>Message</th><th>Context</th></tr></thead><tbody>';
+		$shown = array_slice($log, 0, 50);
+		if ($shown) {
+			foreach ($shown as $e) {
+				echo '<tr>';
+				echo '<td>'.esc_html($e['time'] ?? '').'</td>';
+				echo '<td>'.esc_html($e['msg'] ?? '').'</td>';
+				echo '<td><code>'.esc_html(wp_json_encode($e['ctx'] ?? [])).'</code></td>';
+				echo '</tr>';
+			}
+		} else {
+			echo '<tr><td colspan="3">No log entries.</td></tr>';
+		}
+		echo '</tbody></table>';
+
+		$this->render_admin_footer();
+	}
+
+	/* ------------------------------------------------------------
+	 * Scheduling helpers (Action Scheduler preferred)
+	 * ------------------------------------------------------------ */
+
+	private function as_available() {
+		return function_exists('as_enqueue_async_action') && function_exists('as_schedule_single_action') && function_exists('as_unschedule_all_actions');
+	}
+
+	private function enqueue_async($hook, $args = [], $group = 'lpmd') {
+		if ($this->as_available()) {
+			as_enqueue_async_action($hook, $args, $group);
+			return true;
+		}
+		// WP-Cron fallback
+		wp_schedule_single_event(time() + 10, $hook.'_cron', $args);
+		return true;
+	}
+
+	private function schedule_single($ts, $hook, $args = [], $group = 'lpmd') {
+		$ts = (int)$ts;
+		if ($ts <= 0) return false;
+
+		if ($this->as_available()) {
+			as_schedule_single_action($ts, $hook, $args, $group);
+			return true;
+		}
+		// WP-Cron fallback
+		wp_schedule_single_event($ts, $hook.'_cron', $args);
+		return true;
+	}
+
+	private function unschedule_all($hook, $args = [], $group = 'lpmd') {
+		if ($this->as_available()) {
+			as_unschedule_all_actions($hook, $args, $group);
+			return true;
+		}
+		// WP-Cron cannot reliably unschedule with args in all cases; attempt best-effort
+		$timestamp = wp_next_scheduled($hook.'_cron', $args);
+		while ($timestamp) {
+			wp_unschedule_event($timestamp, $hook.'_cron', $args);
+			$timestamp = wp_next_scheduled($hook.'_cron', $args);
+		}
+		return true;
+	}
+
+	private function schedule_boundaries_for_term_rule($rule) {
+		// Remove old schedules for this term
+		$args = ['taxonomy'=>$rule['taxonomy'], 'term_id'=>(int)$rule['term_id']];
+		$this->unschedule_all(self::AS_APPLY_TERM, $args);
+		$this->unschedule_all(self::AS_REMOVE_TERM, $args);
+
+		// If not enabled or not scheduled, nothing to schedule
+		if (empty($rule['enabled']) || empty($rule['sched_enabled'])) return;
+
+		$from_ts = $this->dt_to_ts($rule['from']);
+		$to_ts   = $this->dt_to_ts($rule['to']);
+
+		// Schedule apply/remove; allow empty one side
+		if ($from_ts) $this->schedule_single($from_ts, self::AS_APPLY_TERM, $args, 'lpmd');
+		if ($to_ts)   $this->schedule_single($to_ts, self::AS_REMOVE_TERM, $args, 'lpmd');
+	}
+
+	private function enqueue_apply_term_rule($taxonomy, $term_id, $reason = 'manual') {
+		$this->enqueue_async(self::AS_APPLY_TERM, ['taxonomy'=>$taxonomy, 'term_id'=>(int)$term_id, 'reason'=>$reason], 'lpmd');
+	}
+
+	private function enqueue_remove_term_rule($taxonomy, $term_id, $reason = 'manual') {
+		$this->enqueue_async(self::AS_REMOVE_TERM, ['taxonomy'=>$taxonomy, 'term_id'=>(int)$term_id, 'reason'=>$reason], 'lpmd');
+	}
+
+	/* ------------------------------------------------------------
+	 * Term relationship change → dirty queue (debounced)
+	 * ------------------------------------------------------------ */
+
+	public function on_term_relationship_change($object_id, $tt_id, $taxonomy) {
+		// We only care about products
+		if (get_post_type($object_id) !== 'product') return;
+
+		$settings = $this->get_settings();
+		$brand_tax = $settings['brand_taxonomy'];
+
+		$watch = ['product_cat', 'product_tag'];
+		if ($brand_tax) $watch[] = $brand_tax;
+
+		if (!in_array($taxonomy, $watch, true)) return;
+
+		$this->queue_dirty_product((int)$object_id);
+		$this->enqueue_dirty_processor('term_change');
+	}
+
+	private function queue_dirty_product($product_id) {
+		$queue = get_option(self::OPT_DIRTY_QUEUE, []);
+		if (!is_array($queue)) $queue = [];
+		$queue[$product_id] = $this->now_ts(); // store last touched
+		update_option(self::OPT_DIRTY_QUEUE, $queue, false);
+	}
+
+	private function enqueue_dirty_processor($reason = 'auto') {
+		$settings = $this->get_settings();
+		$debounce = max(10, (int)($settings['debounce_seconds'] ?? self::DEFAULT_DEBOUNCE_SECONDS));
+
+		// Debounce: schedule only once per debounce window
+		$scheduled = get_option(self::OPT_DIRTY_SCHEDULED, 'no');
+		if ($scheduled === 'yes') return;
+
+		update_option(self::OPT_DIRTY_SCHEDULED, 'yes', false);
+		$run_at = $this->now_ts() + $debounce;
+		$this->schedule_single($run_at, self::AS_PROCESS_DIRTY, ['reason'=>$reason], 'lpmd');
+	}
+
+	/* ------------------------------------------------------------
+	 * Dirty queue processor: recompute best discount and persist meta
+	 * ------------------------------------------------------------ */
+
+	public function handle_dirty_queue($args = []) {
+		update_option(self::OPT_DIRTY_SCHEDULED, 'no', false);
+
+		$queue = get_option(self::OPT_DIRTY_QUEUE, []);
+		if (!is_array($queue) || empty($queue)) {
+			$this->stats_set('last_dirty_run', date_i18n('Y-m-d H:i:s', $this->now_ts()));
+			$this->stats_set('last_dirty_processed', 0);
+			return;
+		}
+
+		$settings = $this->get_settings();
+		$batch_size = max(20, (int)($settings['batch_size'] ?? self::DEFAULT_BATCH_SIZE));
+
+		$product_ids = array_keys($queue);
+		// Clear queue immediately to avoid reprocessing storms; changes after this will enqueue again.
+		update_option(self::OPT_DIRTY_QUEUE, [], false);
+
+		$total = count($product_ids);
+		$this->stats_set('last_dirty_run', date_i18n('Y-m-d H:i:s', $this->now_ts()));
+		$this->stats_set('last_dirty_processed', $total);
+
+		$this->log('Dirty queue processing started', ['count'=>$total, 'reason'=>$args['reason'] ?? 'unknown']);
+
+		$chunks = array_chunk($product_ids, $batch_size);
+		foreach ($chunks as $chunk) {
+			$this->enqueue_async(self::AS_PROCESS_PRODUCTS, ['product_ids'=>$chunk, 'reason'=>'dirty_queue'], 'lpmd');
+		}
+	}
+
+	/* ------------------------------------------------------------
+	 * Scheduled term apply/remove handlers
+	 * ------------------------------------------------------------ */
+
+	public function handle_apply_term_rule($args = [], $reason_fallback = '') {
+		$taxonomy = isset($args['taxonomy']) ? sanitize_text_field($args['taxonomy']) : '';
+		$term_id  = isset($args['term_id']) ? (int)$args['term_id'] : 0;
+		if (!$taxonomy || !$term_id || !taxonomy_exists($taxonomy)) return;
+
+		$rule = $this->get_rule_for_term($taxonomy, $term_id);
+		if (!$rule['enabled']) {
+			$this->log('Apply skipped (rule disabled)', ['taxonomy'=>$taxonomy, 'term_id'=>$term_id]);
+			return;
+		}
+
+		// If schedule is enabled and not active now, do not apply
+		if ($rule['sched_enabled'] && !$this->is_rule_active_now($rule)) {
+			$this->log('Apply skipped (not in schedule window)', ['taxonomy'=>$taxonomy, 'term_id'=>$term_id]);
+			return;
+		}
+
+		// Process all products in this term (max ~3k per user note)
+		$product_ids = $this->get_product_ids_in_term($taxonomy, $term_id);
+		$this->log('Applying term rule', ['taxonomy'=>$taxonomy, 'term_id'=>$term_id, 'count'=>count($product_ids), 'reason'=>$args['reason'] ?? $reason_fallback]);
+
+		$settings = $this->get_settings();
+		$batch_size = max(20, (int)($settings['batch_size'] ?? self::DEFAULT_BATCH_SIZE));
+		foreach (array_chunk($product_ids, $batch_size) as $chunk) {
+			$this->enqueue_async(self::AS_PROCESS_PRODUCTS, ['product_ids'=>$chunk, 'reason'=>"term_apply:{$taxonomy}:{$term_id}"], 'lpmd');
+		}
+	}
+
+	public function handle_remove_term_rule($args = [], $reason_fallback = '') {
+		$taxonomy = isset($args['taxonomy']) ? sanitize_text_field($args['taxonomy']) : '';
+		$term_id  = isset($args['term_id']) ? (int)$args['term_id'] : 0;
+		if (!$taxonomy || !$term_id || !taxonomy_exists($taxonomy)) return;
+
+		// Removing: recompute best discount for products in term
+		$product_ids = $this->get_product_ids_in_term($taxonomy, $term_id);
+		$this->log('Removing term rule (recompute best discount)', ['taxonomy'=>$taxonomy, 'term_id'=>$term_id, 'count'=>count($product_ids), 'reason'=>$args['reason'] ?? $reason_fallback]);
+
+		$settings = $this->get_settings();
+		$batch_size = max(20, (int)($settings['batch_size'] ?? self::DEFAULT_BATCH_SIZE));
+		foreach (array_chunk($product_ids, $batch_size) as $chunk) {
+			$this->enqueue_async(self::AS_PROCESS_PRODUCTS, ['product_ids'=>$chunk, 'reason'=>"term_remove:{$taxonomy}:{$term_id}"], 'lpmd');
+		}
+	}
+
+	private function get_product_ids_in_term($taxonomy, $term_id) {
+		// Efficiently fetch IDs only.
+		$ids = [];
+		$paged = 1;
+		$per_page = 500;
+
+		do {
+			$q = new WP_Query([
+				'post_type'      => 'product',
+				'post_status'    => ['publish','private','draft'],
+				'fields'         => 'ids',
+				'posts_per_page' => $per_page,
+				'paged'          => $paged,
+				'no_found_rows'  => true,
+				'tax_query'      => [[
+					'taxonomy' => $taxonomy,
+					'field'    => 'term_id',
+					'terms'    => [(int)$term_id],
+				]],
+			]);
+			if (!empty($q->posts)) {
+				$ids = array_merge($ids, $q->posts);
+				$paged++;
+			} else {
+				break;
+			}
+		} while (true);
+
+		return array_values(array_unique(array_map('intval', $ids)));
+	}
+
+	/* ------------------------------------------------------------
+	 * Product batch processor: compute best discount + persist prices
+	 * ------------------------------------------------------------ */
+
+	public function handle_product_batch($args = []) {
+		$start = microtime(true);
+
+		$product_ids = $args['product_ids'] ?? [];
+		if (!is_array($product_ids) || empty($product_ids)) return;
+
+		$settings = $this->get_settings();
+		$override_other = (($settings['override_other_sales'] ?? 'yes') === 'yes');
+		$min_price = $settings['min_price'];
+		$min_price = (is_numeric($min_price) && $min_price !== '') ? (float)$min_price : null;
+
+		$processed = 0;
+		$errors = [];
+
+		// Cache active rules by taxonomy+term_id for this run
+		$active_rule_cache = [];
+
+		foreach ($product_ids as $pid) {
+			$pid = (int)$pid;
+			if ($pid <= 0 || get_post_type($pid) !== 'product') continue;
+
+			try {
+				$product = wc_get_product($pid);
+				if (!$product) continue;
+
+				// For variable products: apply per variation and sync parent
+				if ($product->is_type('variable')) {
+					$variation_ids = $product->get_children();
+					$parent_id = $product->get_id();
+
+					foreach ($variation_ids as $vid) {
+						$this->apply_best_discount_to_item((int)$vid, $pid, $active_rule_cache, $override_other, $min_price);
+					}
+
+					// Sync variable pricing
+					if (class_exists('WC_Product_Variable')) {
+						WC_Product_Variable::sync($parent_id);
+					}
+					if (function_exists('wc_delete_product_transients')) {
+						wc_delete_product_transients($parent_id);
+					}
+					if (function_exists('wc_update_product_lookup_tables')) {
+						wc_update_product_lookup_tables($parent_id);
+					}
+				} else {
+					$this->apply_best_discount_to_item($pid, 0, $active_rule_cache, $override_other, $min_price);
+				}
+
+				$processed++;
+			} catch (Throwable $e) {
+				$errors[] = ['product_id'=>$pid, 'error'=>$e->getMessage()];
+			}
+		}
+
+		$dur_ms = (int) round((microtime(true) - $start) * 1000);
+		$this->stats_set('last_batch_run', date_i18n('Y-m-d H:i:s', $this->now_ts()));
+		$this->stats_set('last_batch_processed', $processed);
+		if (!empty($errors)) {
+			$this->stats_set('last_errors', array_slice($errors, 0, 10));
+			$this->log('Batch errors', ['errors'=>array_slice($errors, 0, 10), 'reason'=>$args['reason'] ?? 'unknown']);
+		}
+		$this->log('Processed product batch', ['count'=>$processed, 'duration_ms'=>$dur_ms, 'reason'=>$args['reason'] ?? 'unknown']);
+	}
+
+	private function apply_best_discount_to_item($item_id, $parent_product_id, &$active_rule_cache, $override_other_sales, $min_price_floor) {
+		$item_id = (int)$item_id;
+		$item = wc_get_product($item_id);
+		if (!$item) return;
+
+		// Only apply to items with a regular price
+		$regular = $item->get_regular_price();
+		if ($regular === '' || !is_numeric($regular)) {
+			return;
+		}
+		$regular = (float)$regular;
+
+		// Find best applicable rule across category + brand + tag
+		$best = $this->get_best_applicable_rule_for_item($item_id, $parent_product_id, $regular, $active_rule_cache);
+
+		if ($best) {
+			$new_sale = $best['sale_price'];
+			if ($min_price_floor !== null) {
+				$new_sale = max($min_price_floor, $new_sale);
+			}
+			$new_sale = max(0.0, $new_sale);
+
+			$this->persist_sale_price($item_id, $new_sale, $best['rule'], $override_other_sales);
+		} else {
+			$this->remove_if_ours($item_id);
+		}
+
+		// Clear transients + update lookup tables
+		if (function_exists('wc_delete_product_transients')) {
+			wc_delete_product_transients($item_id);
+		}
+		if (function_exists('wc_update_product_lookup_tables')) {
+			wc_update_product_lookup_tables($item_id);
+		}
+	}
+
+	private function get_best_applicable_rule_for_item($item_id, $parent_product_id, $regular_price, &$active_rule_cache) {
+		$settings = $this->get_settings();
+		$brand_tax = $settings['brand_taxonomy'];
+
+		// Use parent product terms for variations (more consistent)
+		$base_id = $parent_product_id ? (int)$parent_product_id : (int)$item_id;
+
+		$category_terms = wp_get_post_terms($base_id, 'product_cat', ['fields'=>'ids']);
+		$tag_terms      = wp_get_post_terms($base_id, 'product_tag', ['fields'=>'ids']);
+		$brand_terms    = taxonomy_exists($brand_tax) ? wp_get_post_terms($base_id, $brand_tax, ['fields'=>'ids']) : [];
+
+		$candidates = [];
+
+		foreach ((array)$category_terms as $tid) {
+			$candidates[] = ['taxonomy'=>'product_cat', 'term_id'=>(int)$tid];
+		}
+		foreach ((array)$brand_terms as $tid) {
+			$candidates[] = ['taxonomy'=>$brand_tax, 'term_id'=>(int)$tid];
+		}
+		foreach ((array)$tag_terms as $tid) {
+			$candidates[] = ['taxonomy'=>'product_tag', 'term_id'=>(int)$tid];
+		}
+
+		$best = null;
+
+		foreach ($candidates as $c) {
+			$key = $c['taxonomy'].':'.$c['term_id'];
+
+			if (!isset($active_rule_cache[$key])) {
+				$rule = $this->get_rule_for_term($c['taxonomy'], $c['term_id']);
+				$active_rule_cache[$key] = ($this->is_rule_active_now($rule) ? $rule : null);
+			}
+			$rule = $active_rule_cache[$key];
+			if (!$rule) continue;
+
+			$sale = $this->compute_sale_price($regular_price, $rule['type'], $rule['amount']);
+			if ($sale === null) continue;
+
+			$entry = [
+				'sale_price' => $sale,
+				'rule'       => ['type'=>$rule['taxonomy'], 'term_id'=>(int)$rule['term_id']],
+			];
+
+			// Best discount = lowest final price
+			if ($best === null || $entry['sale_price'] < $best['sale_price']) {
+				$best = $entry;
+			} elseif ($best !== null && $entry['sale_price'] === $best['sale_price']) {
+				// Tie-break: prefer percent over fixed (deterministic) then lower term_id
+				$current_is_percent = ($this->get_rule_for_term($entry['rule']['type'], $entry['rule']['term_id'])['type'] === 'percent');
+				$best_is_percent    = ($this->get_rule_for_term($best['rule']['type'], $best['rule']['term_id'])['type'] === 'percent');
+				if ($current_is_percent && !$best_is_percent) {
+					$best = $entry;
+				} elseif ($current_is_percent === $best_is_percent) {
+					if ($entry['rule']['term_id'] < $best['rule']['term_id']) {
+						$best = $entry;
+					}
+				}
+			}
+		}
+
+		return $best;
+	}
+
+	private function compute_sale_price($regular, $type, $amount) {
+		$regular = (float)$regular;
+		$amount = (float)$amount;
+		if ($regular <= 0) return null;
+		if ($amount <= 0) return null;
+
+		if ($type === 'fixed') {
+			return max(0.0, $regular - $amount);
+		}
+		// percent
+		$p = min(100.0, max(0.0, $amount));
+		return max(0.0, $regular * (1.0 - ($p / 100.0)));
+	}
+
+	private function persist_sale_price($item_id, $new_sale, $rule_ref, $override_other_sales) {
+		$item_id = (int)$item_id;
+		$new_sale = (string) wc_format_decimal($new_sale, wc_get_price_decimals());
+
+		$existing_sale = get_post_meta($item_id, '_sale_price', true);
+		$existing_sale = ($existing_sale === '') ? '' : (string)$existing_sale;
+
+		$applied_json = get_post_meta($item_id, self::PMETA_APPLIED_RULE, true);
+		$applied = $applied_json ? json_decode($applied_json, true) : null;
+		$is_ours = (is_array($applied) && isset($applied['type'], $applied['term_id']));
+
+		// If product has a sale price from someone else and we don't override, skip
+		if (!$is_ours && $existing_sale !== '' && !$override_other_sales) {
+			return;
+		}
+
+		// If not ours and overriding, snapshot previous sale price once
+		if (!$is_ours) {
+			update_post_meta($item_id, self::PMETA_PREV_SALE, $existing_sale);
+		}
+
+		// Write sale and current price
+		update_post_meta($item_id, '_sale_price', $new_sale);
+		update_post_meta($item_id, '_price', $new_sale);
+
+		// Attribution
+		update_post_meta($item_id, self::PMETA_APPLIED_RULE, wp_json_encode($rule_ref));
+		update_post_meta($item_id, self::PMETA_APPLIED_AT, date_i18n('Y-m-d H:i:s', $this->now_ts()));
+		update_post_meta($item_id, self::PMETA_APPLIED_PRICE, $new_sale);
+	}
+
+	private function remove_if_ours($item_id) {
+		$item_id = (int)$item_id;
+
+		$applied_json = get_post_meta($item_id, self::PMETA_APPLIED_RULE, true);
+		$applied = $applied_json ? json_decode($applied_json, true) : null;
+		$is_ours = (is_array($applied) && isset($applied['type'], $applied['term_id']));
+		if (!$is_ours) return;
+
+		$prev = get_post_meta($item_id, self::PMETA_PREV_SALE, true);
+
+		if ($prev !== '' && $prev !== null) {
+			// restore previous sale price
+			update_post_meta($item_id, '_sale_price', (string)$prev);
+			update_post_meta($item_id, '_price', (string)$prev);
+		} else {
+			// remove sale; revert to regular price
+			delete_post_meta($item_id, '_sale_price');
+
+			$regular = get_post_meta($item_id, '_regular_price', true);
+			if ($regular !== '' && $regular !== null) {
+				update_post_meta($item_id, '_price', (string)$regular);
+			} else {
+				delete_post_meta($item_id, '_price');
+			}
+		}
+
+		// Clear attribution
+		delete_post_meta($item_id, self::PMETA_APPLIED_RULE);
+		delete_post_meta($item_id, self::PMETA_PREV_SALE);
+		delete_post_meta($item_id, self::PMETA_APPLIED_AT);
+		delete_post_meta($item_id, self::PMETA_APPLIED_PRICE);
+
+		if (function_exists('wc_delete_product_transients')) {
+			wc_delete_product_transients($item_id);
+		}
+		if (function_exists('wc_update_product_lookup_tables')) {
+			wc_update_product_lookup_tables($item_id);
+		}
+	}
+}
+
+LPMD_Mass_Discounts::instance();
+
+/**
+ * OPTIONAL (recommended): set your brand taxonomy slug here if auto-detection doesn't match:
+ *
+ * add_filter('lpmd_brand_taxonomy', function() {
+ *   return 'product_brands'; // example
+ * });
+ */
