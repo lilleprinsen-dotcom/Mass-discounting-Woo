@@ -422,6 +422,20 @@ final class LPMD_Mass_Discounts {
 		return true;
 	}
 
+	private function is_rule_planned($rule) {
+		if (empty($rule['enabled']) || empty($rule['sched_enabled'])) return false;
+		if ($this->is_rule_active_now($rule)) return false;
+
+		$now = $this->now_ts();
+		$from_ts = $this->dt_to_ts($rule['from'] ?? '');
+		$to_ts   = $this->dt_to_ts($rule['to'] ?? '');
+
+		if ($from_ts > $now) return true;
+		if ($from_ts <= 0 && $to_ts > $now) return true;
+
+		return false;
+	}
+
 	private function save_rule_for_term($term_id, $payload) {
 		$enabled = !empty($payload['enabled']) ? 'yes' : 'no';
 		$type    = ($payload['type'] === 'fixed') ? 'fixed' : 'percent';
@@ -482,11 +496,46 @@ final class LPMD_Mass_Discounts {
 		$args = [
 			'taxonomy'   => $taxonomy,
 			'hide_empty' => false,
-			'number'     => $per_page,
-			'offset'     => $offset,
 			'search'     => $search,
+			'number'     => 0,
+			'orderby'    => 'name',
+			'order'      => 'ASC',
 		];
-		$terms = get_terms($args);
+		$all_terms = get_terms($args);
+		$terms = [];
+		if (!is_wp_error($all_terms) && !empty($all_terms)) {
+			$rows = [];
+			foreach ($all_terms as $term) {
+				$rule = $this->get_rule_for_term($taxonomy, $term->term_id);
+				$rows[] = [
+					'term'       => $term,
+					'is_active'  => $this->is_rule_active_now($rule),
+					'is_planned' => $this->is_rule_planned($rule),
+				];
+			}
+
+			usort($rows, function($a, $b) {
+				$a_priority = !empty($a['is_active']) ? 0 : (!empty($a['is_planned']) ? 1 : 2);
+				$b_priority = !empty($b['is_active']) ? 0 : (!empty($b['is_planned']) ? 1 : 2);
+				if ($a_priority !== $b_priority) {
+					return $a_priority <=> $b_priority;
+				}
+
+				$a_name = isset($a['term']->name) ? (string)$a['term']->name : '';
+				$b_name = isset($b['term']->name) ? (string)$b['term']->name : '';
+				$name_compare = strcasecmp($a_name, $b_name);
+				if ($name_compare !== 0) return $name_compare;
+
+				$a_id = isset($a['term']->term_id) ? (int)$a['term']->term_id : 0;
+				$b_id = isset($b['term']->term_id) ? (int)$b['term']->term_id : 0;
+				return $a_id <=> $b_id;
+			});
+
+			$rows = array_slice($rows, $offset, $per_page);
+			$terms = array_values(array_map(function($row) {
+				return $row['term'];
+			}, $rows));
+		}
 
 		$total_terms = wp_count_terms(['taxonomy'=>$taxonomy, 'hide_empty'=>false, 'search'=>$search]);
 		$total_pages = (int) ceil(max(1, (int)$total_terms) / $per_page);
