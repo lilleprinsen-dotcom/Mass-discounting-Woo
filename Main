@@ -19,6 +19,7 @@ if (!defined('ABSPATH')) exit;
 final class LPMD_Mass_Discounts {
 	const OPT_DIRTY_QUEUE      = 'lpmd_dirty_queue_v1';
 	const OPT_DIRTY_SCHEDULED  = 'lpmd_dirty_scheduled_v1';
+	const OPT_DIRTY_SCHEDULED_AT = 'lpmd_dirty_scheduled_at_v1';
 	const OPT_SETTINGS         = 'lpmd_settings_v1';
 	const OPT_LOG              = 'lpmd_log_v1';
 	const OPT_STATS            = 'lpmd_stats_v1';
@@ -971,13 +972,26 @@ final class LPMD_Mass_Discounts {
 	private function enqueue_dirty_processor($reason = 'auto') {
 		$settings = $this->get_settings();
 		$debounce = max(10, (int)($settings['debounce_seconds'] ?? self::DEFAULT_DEBOUNCE_SECONDS));
+		$now = $this->now_ts();
+		$stale_after = max(30, $debounce * 3);
 
 		// Debounce: schedule only once per debounce window
 		$scheduled = get_option(self::OPT_DIRTY_SCHEDULED, 'no');
-		if ($scheduled === 'yes') return;
+		$scheduled_at = (int)get_option(self::OPT_DIRTY_SCHEDULED_AT, 0);
+		if ($scheduled === 'yes' && $scheduled_at > 0 && ($now - $scheduled_at) < $stale_after) return;
+
+		// Recover from stale scheduling locks (e.g. failed cron/queue run)
+		if ($scheduled === 'yes') {
+			$this->log('Dirty queue scheduler lock was stale; rescheduling', [
+				'scheduled_at' => $scheduled_at,
+				'now' => $now,
+				'stale_after' => $stale_after,
+			]);
+		}
 
 		update_option(self::OPT_DIRTY_SCHEDULED, 'yes', false);
-		$run_at = $this->now_ts() + $debounce;
+		$run_at = $now + $debounce;
+		update_option(self::OPT_DIRTY_SCHEDULED_AT, $run_at, false);
 		$this->schedule_single($run_at, self::AS_PROCESS_DIRTY, ['reason'=>$reason], 'lpmd');
 	}
 
@@ -1036,6 +1050,7 @@ final class LPMD_Mass_Discounts {
 	public function handle_dirty_queue($args = [], $reason_fallback = '') {
 		$reason = $this->normalize_job_reason($args, $reason_fallback);
 		update_option(self::OPT_DIRTY_SCHEDULED, 'no', false);
+		update_option(self::OPT_DIRTY_SCHEDULED_AT, 0, false);
 
 		$queue = get_option(self::OPT_DIRTY_QUEUE, []);
 		if (!is_array($queue) || empty($queue)) {
