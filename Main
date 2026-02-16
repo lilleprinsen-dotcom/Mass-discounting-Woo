@@ -72,7 +72,7 @@ final class LPMD_Mass_Discounts {
 
 		// Term relationship watchers (auto-discount when product added/removed)
 		add_action('added_term_relationship', [$this, 'on_term_relationship_change'], 10, 3);
-		add_action('deleted_term_relationship', [$this, 'on_term_relationship_change'], 10, 3);
+		add_action('delete_term_relationships', [$this, 'on_delete_term_relationships'], 10, 3);
 
 		// Stock status watchers (re-check discounts when items come back in stock)
 		add_action('woocommerce_product_set_stock_status', [$this, 'on_product_stock_status_change'], 10, 3);
@@ -116,7 +116,7 @@ final class LPMD_Mass_Discounts {
 		$settings = get_option(self::OPT_SETTINGS, []);
 		if (!is_array($settings)) $settings = [];
 		$settings['rounding_mode'] = $this->normalize_rounding_mode($settings['rounding_mode'] ?? 'none');
-		$settings['brand_taxonomy'] = apply_filters('lpmd_brand_taxonomy', $settings['brand_taxonomy'] ?? $this->detect_brand_taxonomy());
+		$settings['brand_taxonomy'] = sanitize_key((string) apply_filters('lpmd_brand_taxonomy', $settings['brand_taxonomy'] ?? $this->detect_brand_taxonomy()));
 		return $settings;
 	}
 
@@ -184,8 +184,14 @@ final class LPMD_Mass_Discounts {
 
 	private function dt_to_ts($mysql_dt) {
 		if (!$mysql_dt) return 0;
-		$ts = strtotime($mysql_dt);
-		return $ts ? (int)$ts : 0;
+
+		try {
+			$timezone = function_exists('wp_timezone') ? wp_timezone() : new DateTimeZone('UTC');
+			$dt = new DateTimeImmutable((string)$mysql_dt, $timezone);
+			return (int)$dt->getTimestamp();
+		} catch (Exception $e) {
+			return 0;
+		}
 	}
 
 	private function ts_to_mysql($ts) {
@@ -541,6 +547,9 @@ final class LPMD_Mass_Discounts {
 		}
 
 		$total_terms = wp_count_terms(['taxonomy'=>$taxonomy, 'hide_empty'=>false, 'search'=>$search]);
+		if (is_wp_error($total_terms)) {
+			$total_terms = 0;
+		}
 		$total_pages = (int) ceil(max(1, (int)$total_terms) / $per_page);
 
 		$this->render_admin_header($title);
@@ -687,7 +696,7 @@ final class LPMD_Mass_Discounts {
 			}
 			if ($act === 'save_settings') {
 				$settings = $this->get_settings();
-				$settings['rounding_mode'] = $this->normalize_rounding_mode($_POST['rounding_mode'] ?? 'none');
+				$settings['rounding_mode'] = $this->normalize_rounding_mode(isset($_POST['rounding_mode']) ? sanitize_text_field(wp_unslash($_POST['rounding_mode'])) : 'none');
 				update_option(self::OPT_SETTINGS, $settings, false);
 				echo '<div class="notice notice-success"><p>Saved settings.</p></div>';
 			}
@@ -960,6 +969,10 @@ final class LPMD_Mass_Discounts {
 		$this->enqueue_dirty_processor('term_change');
 	}
 
+	public function on_delete_term_relationships($object_id, $tt_ids, $taxonomy) {
+		$this->on_term_relationship_change($object_id, 0, $taxonomy);
+	}
+
 	public function on_product_stock_status_change($product_id, $stock_status, $product = null) {
 		if ((int)$product_id <= 0 || get_post_type($product_id) !== 'product') return;
 
@@ -1135,7 +1148,7 @@ final class LPMD_Mass_Discounts {
 		$chunks = array_chunk($product_ids, $batch_size);
 		$this->stats_start_chunk_job(count($chunks), $reason);
 		foreach ($chunks as $chunk) {
-			$this->enqueue_async(self::AS_PROCESS_PRODUCTS, ['product_ids'=>$chunk, 'reason'=>'dirty_queue'], 'lpmd');
+			$this->enqueue_async(self::AS_PROCESS_PRODUCTS, ['product_ids'=>$chunk, 'reason'=>$reason], 'lpmd');
 		}
 	}
 
@@ -1402,7 +1415,11 @@ final class LPMD_Mass_Discounts {
 
 			$entry = [
 				'sale_price' => $sale,
-				'rule'       => ['type'=>$rule['taxonomy'], 'term_id'=>(int)$rule['term_id']],
+				'rule'       => [
+					'type' => (string)$rule['taxonomy'],
+					'term_id' => (int)$rule['term_id'],
+					'discount_type' => (string)$rule['type'],
+				],
 			];
 
 			// Best discount = lowest final price
@@ -1410,8 +1427,8 @@ final class LPMD_Mass_Discounts {
 				$best = $entry;
 			} elseif ($best !== null && $entry['sale_price'] === $best['sale_price']) {
 				// Tie-break: prefer percent over fixed (deterministic) then lower term_id
-				$current_is_percent = ($this->get_rule_for_term($entry['rule']['type'], $entry['rule']['term_id'])['type'] === 'percent');
-				$best_is_percent    = ($this->get_rule_for_term($best['rule']['type'], $best['rule']['term_id'])['type'] === 'percent');
+				$current_is_percent = (($entry['rule']['discount_type'] ?? '') === 'percent');
+				$best_is_percent    = (($best['rule']['discount_type'] ?? '') === 'percent');
 				if ($current_is_percent && !$best_is_percent) {
 					$best = $entry;
 				} elseif ($current_is_percent === $best_is_percent) {
