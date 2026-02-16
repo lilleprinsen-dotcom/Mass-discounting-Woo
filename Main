@@ -1468,8 +1468,9 @@ final class LPMD_Mass_Discounts {
 			return false;
 		}
 
-		// If not ours and overriding, snapshot previous sale price once
-		if (!$is_ours) {
+		// If not ours and overriding, snapshot previous sale price once.
+		// Keep the first snapshot so we can always roll back to the original pre-LPMD state.
+		if (!$is_ours && !metadata_exists('post', $item_id, self::PMETA_PREV_SALE)) {
 			$this->set_post_meta_silent($item_id, self::PMETA_PREV_SALE, $existing_sale);
 		}
 
