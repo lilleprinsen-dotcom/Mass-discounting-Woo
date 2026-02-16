@@ -46,6 +46,7 @@ final class LPMD_Mass_Discounts {
 	// Default tuning
 	const DEFAULT_DEBOUNCE_SECONDS = 60;
 	const DEFAULT_BATCH_SIZE       = 120; // products per batch (variations handled inside)
+	const AUTO_RECONCILE_DELAY_SECONDS = 3600; // fallback when admin saves without queueing
 
 	private static $instance = null;
 
@@ -480,6 +481,7 @@ final class LPMD_Mass_Discounts {
 
 				$rule = $this->get_rule_for_term($taxonomy, $term_id);
 				$this->schedule_boundaries_for_term_rule($rule);
+				$this->schedule_auto_reconcile_for_term($taxonomy, $term_id, $rule);
 
 				if ($action === 'queue_apply') {
 					$this->enqueue_apply_term_rule($taxonomy, $term_id, 'manual_apply');
@@ -916,6 +918,26 @@ final class LPMD_Mass_Discounts {
 
 	private function enqueue_remove_term_rule($taxonomy, $term_id, $reason = 'manual') {
 		$this->enqueue_async(self::AS_REMOVE_TERM, ['taxonomy'=>$taxonomy, 'term_id'=>(int)$term_id, 'reason'=>$reason], 'lpmd');
+	}
+
+	private function schedule_auto_reconcile_for_term($taxonomy, $term_id, $rule) {
+		$taxonomy = sanitize_key((string)$taxonomy);
+		$term_id = (int)$term_id;
+		if ($taxonomy === '' || $term_id <= 0) return;
+
+		$reason = 'auto_saved_reconcile';
+		$args = ['taxonomy'=>$taxonomy, 'term_id'=>$term_id, 'reason'=>$reason];
+
+		if ($this->is_rule_active_now($rule)) {
+			$this->unschedule_all(self::AS_APPLY_TERM, $args);
+			$this->schedule_single($this->now_ts() + self::AUTO_RECONCILE_DELAY_SECONDS, self::AS_APPLY_TERM, $args, 'lpmd');
+			$this->log('Scheduled fallback apply after save', ['taxonomy'=>$taxonomy, 'term_id'=>$term_id, 'delay_seconds'=>self::AUTO_RECONCILE_DELAY_SECONDS]);
+			return;
+		}
+
+		$this->unschedule_all(self::AS_REMOVE_TERM, $args);
+		$this->schedule_single($this->now_ts() + self::AUTO_RECONCILE_DELAY_SECONDS, self::AS_REMOVE_TERM, $args, 'lpmd');
+		$this->log('Scheduled fallback remove after save', ['taxonomy'=>$taxonomy, 'term_id'=>$term_id, 'delay_seconds'=>self::AUTO_RECONCILE_DELAY_SECONDS]);
 	}
 
 	/* ------------------------------------------------------------
