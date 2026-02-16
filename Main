@@ -944,6 +944,8 @@ final class LPMD_Mass_Discounts {
 		// Prioritize restocks. Other status changes can still be ignored to save resources.
 		if ($stock_status !== 'instock') return;
 
+		if (!$this->should_recheck_stock_changed_product((int)$product_id)) return;
+
 		$this->queue_dirty_product((int)$product_id);
 		$this->enqueue_dirty_processor('stock_change');
 	}
@@ -958,8 +960,44 @@ final class LPMD_Mass_Discounts {
 		// Recompute parent only when variation is back in stock.
 		if ($stock_status !== 'instock') return;
 
+		if (!$this->should_recheck_stock_changed_product($parent_id)) return;
+
 		$this->queue_dirty_product($parent_id);
 		$this->enqueue_dirty_processor('stock_change');
+	}
+
+	private function should_recheck_stock_changed_product($product_id) {
+		$product_id = (int)$product_id;
+		if ($product_id <= 0) return false;
+
+		// Always allow rechecks for items currently carrying our attribution metadata,
+		// so stale discounts can still be cleaned up.
+		$applied_json = get_post_meta($product_id, self::PMETA_APPLIED_RULE, true);
+		$applied = $applied_json ? json_decode($applied_json, true) : null;
+		$is_ours = (is_array($applied) && isset($applied['type'], $applied['term_id']));
+		if ($is_ours) return true;
+
+		$settings = $this->get_settings();
+		$brand_tax = $settings['brand_taxonomy'];
+
+		$watch_taxonomies = ['product_cat', 'product_tag'];
+		if ($brand_tax && taxonomy_exists($brand_tax)) {
+			$watch_taxonomies[] = $brand_tax;
+		}
+
+		foreach ($watch_taxonomies as $taxonomy) {
+			$term_ids = wp_get_post_terms($product_id, $taxonomy, ['fields' => 'ids']);
+			if (!is_array($term_ids) || empty($term_ids)) continue;
+
+			foreach ($term_ids as $term_id) {
+				$rule = $this->get_rule_for_term($taxonomy, (int)$term_id);
+				if ($this->is_rule_active_now($rule)) {
+					return true;
+				}
+			}
+		}
+
+		return false;
 	}
 
 	private function queue_dirty_product($product_id) {
