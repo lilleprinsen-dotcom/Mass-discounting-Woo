@@ -186,8 +186,63 @@ final class LPMD_Mass_Discounts {
 
 	private function dt_to_ts($mysql_dt) {
 		if (!$mysql_dt) return 0;
+
+		$mysql_dt = trim((string) $mysql_dt);
+
+		$no_dt = \DateTime::createFromFormat('d.m.Y H:i:s', $mysql_dt);
+		if ($no_dt instanceof \DateTime) {
+			return (int) $no_dt->getTimestamp();
+		}
+
+		$no_dt_no_seconds = \DateTime::createFromFormat('d.m.Y H:i', $mysql_dt);
+		if ($no_dt_no_seconds instanceof \DateTime) {
+			return (int) $no_dt_no_seconds->getTimestamp();
+		}
+
 		$ts = strtotime($mysql_dt);
 		return $ts ? (int)$ts : 0;
+	}
+
+	private function parse_admin_datetime_input($value) {
+		$value = trim((string) $value);
+		if ($value === '') return '';
+
+		$no_dt = \DateTime::createFromFormat('d.m.Y H:i:s', $value);
+		if ($no_dt instanceof \DateTime) {
+			return $no_dt->format('Y-m-d H:i:s');
+		}
+
+		$no_dt_no_seconds = \DateTime::createFromFormat('d.m.Y H:i', $value);
+		if ($no_dt_no_seconds instanceof \DateTime) {
+			return $no_dt_no_seconds->format('Y-m-d H:i:s');
+		}
+
+		$ts = strtotime($value);
+		if (!$ts) return '';
+
+		return gmdate('Y-m-d H:i:s', $ts + (get_option('gmt_offset') * HOUR_IN_SECONDS));
+	}
+
+	private function format_admin_datetime($mysql_dt) {
+		$ts = $this->dt_to_ts($mysql_dt);
+		if ($ts <= 0) return '';
+
+		return date_i18n('d.m.Y H:i:s', $ts);
+	}
+
+	private function normalize_admin_amount_input($value) {
+		$value = trim((string) $value);
+		if ($value === '') return '0';
+
+		$value = str_replace(',', '.', $value);
+
+		return is_numeric($value) ? (string) $value : '0';
+	}
+
+	private function format_admin_amount($amount) {
+		$formatted = number_format((float) $amount, 2, ',', '');
+		$formatted = rtrim($formatted, '0');
+		return rtrim($formatted, ',');
 	}
 
 	private function ts_to_mysql($ts) {
@@ -357,7 +412,7 @@ final class LPMD_Mass_Discounts {
 
 	private function render_admin_header($title) {
 		echo '<div class="wrap"><h1>'.esc_html($title).'</h1>';
-		echo '<p><strong>Server time:</strong> '.esc_html(date_i18n('Y-m-d H:i:s', $this->now_ts())).'</p>';
+		echo '<p><strong>Server time:</strong> '.esc_html(date_i18n('d.m.Y H:i:s', $this->now_ts())).'</p>';
 		$this->render_admin_styles();
 	}
 
@@ -445,10 +500,10 @@ final class LPMD_Mass_Discounts {
 	private function save_rule_for_term($term_id, $payload) {
 		$enabled = !empty($payload['enabled']) ? 'yes' : 'no';
 		$type    = ($payload['type'] === 'fixed') ? 'fixed' : 'percent';
-		$amount  = is_numeric($payload['amount']) ? (string)$payload['amount'] : '0';
+		$amount  = $this->normalize_admin_amount_input($payload['amount'] ?? '0');
 		$sen     = !empty($payload['sched_enabled']) ? 'yes' : 'no';
-		$from    = !empty($payload['from']) ? sanitize_text_field($payload['from']) : '';
-		$to      = !empty($payload['to']) ? sanitize_text_field($payload['to']) : '';
+		$from    = !empty($payload['from']) ? $this->parse_admin_datetime_input($payload['from']) : '';
+		$to      = !empty($payload['to']) ? $this->parse_admin_datetime_input($payload['to']) : '';
 		$remove_on_oos = !empty($payload['remove_on_oos']) ? 'yes' : 'no';
 
 		update_term_meta($term_id, self::META_ENABLED, $enabled);
@@ -552,7 +607,7 @@ final class LPMD_Mass_Discounts {
 
 		$this->render_admin_header($title);
 
-		echo '<div class="lpmd-help"><p><strong>How to use this page:</strong> enable a rule, set discount type + amount, choose whether to remove it when stock hits 0/backorder, optionally schedule dates, then click <em>Save</em>. Use <em>Queue apply</em> to recalculate prices now or <em>Queue remove</em> to remove this rule from matching products.</p><p><strong>Date format:</strong> YYYY-MM-DD HH:MM:SS in your WordPress site timezone.</p></div>';
+		echo '<div class="lpmd-help"><p><strong>How to use this page:</strong> enable a rule, set discount type + amount, choose whether to remove it when stock hits 0/backorder, optionally schedule dates, then click <em>Save</em>. Use <em>Queue apply</em> to recalculate prices now or <em>Queue remove</em> to remove this rule from matching products.</p><p><strong>Date format:</strong> DD.MM.YYYY HH:MM:SS in your WordPress site timezone.</p></div>';
 		echo '<form method="get" style="margin:10px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">';
 		echo '<input type="hidden" name="page" value="'.esc_attr($page_slug).'" />';
 		echo '<input type="search" name="s" value="'.esc_attr($search).'" placeholder="Search term..." />';
@@ -591,7 +646,7 @@ final class LPMD_Mass_Discounts {
 				echo '</select>';
 				echo '</td>';
 
-				echo '<td data-label="Amount"><input type="text" name="amount" value="'.esc_attr((string)$rule['amount']).'" style="width:90px;" /></td>';
+				echo '<td data-label="Amount"><input type="text" name="amount" value="'.esc_attr($this->format_admin_amount($rule['amount'])).'" style="width:90px;" /></td>';
 
 				echo '<td data-label="Apply">';
 				echo '<label><input type="checkbox" name="enabled" value="1" '.checked($rule['enabled'], true, false).' /> Enabled</label>';
@@ -601,8 +656,8 @@ final class LPMD_Mass_Discounts {
 				echo '<td data-label="Schedule"><label><input type="checkbox" name="sched_enabled" value="1" '.checked($rule['sched_enabled'], true, false).' /> Scheduled</label></td>';
 				echo '<td data-label="Remove at stock 0/backorder"><label><input type="checkbox" name="remove_on_oos" value="1" '.checked($rule['remove_on_oos'], true, false).' /> Remove</label></td>';
 
-				echo '<td data-label="From date"><input type="text" name="from_dt" value="'.esc_attr($rule['from']).'" placeholder="YYYY-MM-DD HH:MM:SS" style="width:170px;" /></td>';
-				echo '<td data-label="To date"><input type="text" name="to_dt" value="'.esc_attr($rule['to']).'" placeholder="YYYY-MM-DD HH:MM:SS" style="width:170px;" /></td>';
+				echo '<td data-label="From date"><input type="text" name="from_dt" value="'.esc_attr($this->format_admin_datetime($rule['from'])).'" placeholder="DD.MM.YYYY HH:MM:SS" style="width:170px;" /></td>';
+				echo '<td data-label="To date"><input type="text" name="to_dt" value="'.esc_attr($this->format_admin_datetime($rule['to'])).'" placeholder="DD.MM.YYYY HH:MM:SS" style="width:170px;" /></td>';
 
 				echo '<td data-label="Actions">';
 				echo '<div class="lpmd-button-group">';
@@ -660,7 +715,7 @@ final class LPMD_Mass_Discounts {
 		echo '<hr>';
 		echo '<h2>Settings</h2>';
 		echo '<p><strong>Debounce:</strong> '.(int)$settings['debounce_seconds'].'s | <strong>Batch size:</strong> '.(int)$settings['batch_size'].' | <strong>Override other sales:</strong> '.esc_html($settings['override_other_sales']).' | <strong>Rounding mode:</strong> '.esc_html($this->get_rounding_mode_label($settings['rounding_mode'] ?? 'none')).'</p>';
-		echo '<p><small>Dates are interpreted in WordPress site timezone. Use format: YYYY-MM-DD HH:MM:SS</small></p>';
+		echo '<p><small>Dates are interpreted in WordPress site timezone. Use format: DD.MM.YYYY HH:MM:SS</small></p>';
 
 		$this->render_admin_footer();
 	}
