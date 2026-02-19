@@ -30,12 +30,14 @@ final class LPMD_Mass_Discounts {
 	const META_SCHED_ENABLED   = 'lpmd_sched_enabled';
 	const META_FROM            = 'lpmd_from'; // mysql datetime in site timezone
 	const META_TO              = 'lpmd_to';   // mysql datetime in site timezone
+	const META_REMOVE_ON_OOS   = 'lpmd_remove_on_oos'; // yes|no
 
 	// Attribution metas (product/variation)
 	const PMETA_APPLIED_RULE   = '_lpmd_applied_rule'; // json: {type, term_id}
 	const PMETA_PREV_SALE      = '_lpmd_prev_sale_price';
 	const PMETA_APPLIED_AT     = '_lpmd_applied_at';
 	const PMETA_APPLIED_PRICE  = '_lpmd_applied_price';
+	const PMETA_BLOCKED_RULES  = '_lpmd_blocked_rules'; // json array of "taxonomy:term_id"
 
 	// Action names
 	const AS_PROCESS_PRODUCTS  = 'lpmd_process_product_batch';
@@ -396,6 +398,7 @@ final class LPMD_Mass_Discounts {
 		$sen     = (string) get_term_meta($term_id, self::META_SCHED_ENABLED, true);
 		$from    = (string) get_term_meta($term_id, self::META_FROM, true);
 		$to      = (string) get_term_meta($term_id, self::META_TO, true);
+		$remove_on_oos = (string) get_term_meta($term_id, self::META_REMOVE_ON_OOS, true);
 
 		return [
 			'taxonomy' => $taxonomy,
@@ -406,6 +409,7 @@ final class LPMD_Mass_Discounts {
 			'sched_enabled' => ($sen === 'yes'),
 			'from'     => $from,
 			'to'       => $to,
+			'remove_on_oos' => ($remove_on_oos === 'yes'),
 		];
 	}
 
@@ -445,6 +449,7 @@ final class LPMD_Mass_Discounts {
 		$sen     = !empty($payload['sched_enabled']) ? 'yes' : 'no';
 		$from    = !empty($payload['from']) ? sanitize_text_field($payload['from']) : '';
 		$to      = !empty($payload['to']) ? sanitize_text_field($payload['to']) : '';
+		$remove_on_oos = !empty($payload['remove_on_oos']) ? 'yes' : 'no';
 
 		update_term_meta($term_id, self::META_ENABLED, $enabled);
 		update_term_meta($term_id, self::META_TYPE, $type);
@@ -452,6 +457,7 @@ final class LPMD_Mass_Discounts {
 		update_term_meta($term_id, self::META_SCHED_ENABLED, $sen);
 		update_term_meta($term_id, self::META_FROM, $from);
 		update_term_meta($term_id, self::META_TO, $to);
+		update_term_meta($term_id, self::META_REMOVE_ON_OOS, $remove_on_oos);
 	}
 
 	private function render_rules_table($taxonomy, $title, $page_slug) {
@@ -476,6 +482,7 @@ final class LPMD_Mass_Discounts {
 					'sched_enabled'=> !empty($_POST['sched_enabled']),
 					'from'         => isset($_POST['from_dt']) ? sanitize_text_field(wp_unslash($_POST['from_dt'])) : '',
 					'to'           => isset($_POST['to_dt']) ? sanitize_text_field(wp_unslash($_POST['to_dt'])) : '',
+					'remove_on_oos'=> !empty($_POST['remove_on_oos']),
 				];
 				$this->save_rule_for_term($term_id, $payload);
 
@@ -545,7 +552,7 @@ final class LPMD_Mass_Discounts {
 
 		$this->render_admin_header($title);
 
-		echo '<div class="lpmd-help"><p><strong>How to use this page:</strong> enable a rule, set discount type + amount, optionally schedule dates, then click <em>Save</em>. Use <em>Queue apply</em> to recalculate prices now or <em>Queue remove</em> to remove this rule from matching products.</p><p><strong>Date format:</strong> YYYY-MM-DD HH:MM:SS in your WordPress site timezone.</p></div>';
+		echo '<div class="lpmd-help"><p><strong>How to use this page:</strong> enable a rule, set discount type + amount, choose whether to remove it when stock hits 0/backorder, optionally schedule dates, then click <em>Save</em>. Use <em>Queue apply</em> to recalculate prices now or <em>Queue remove</em> to remove this rule from matching products.</p><p><strong>Date format:</strong> YYYY-MM-DD HH:MM:SS in your WordPress site timezone.</p></div>';
 		echo '<form method="get" style="margin:10px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">';
 		echo '<input type="hidden" name="page" value="'.esc_attr($page_slug).'" />';
 		echo '<input type="search" name="s" value="'.esc_attr($search).'" placeholder="Search term..." />';
@@ -560,6 +567,7 @@ final class LPMD_Mass_Discounts {
 		echo '<th>Amount(,-)</th>';
 		echo '<th>Apply</th>';
 		echo '<th>Schedule discount</th>';
+		echo '<th>Remove at stock 0/backorder</th>';
 		echo '<th>From Date (Server Time)</th>';
 		echo '<th>To Date (Server Time)</th>';
 		echo '<th>Queue</th>';
@@ -591,6 +599,7 @@ final class LPMD_Mass_Discounts {
 				echo '</td>';
 
 				echo '<td data-label="Schedule"><label><input type="checkbox" name="sched_enabled" value="1" '.checked($rule['sched_enabled'], true, false).' /> Scheduled</label></td>';
+				echo '<td data-label="Remove at stock 0/backorder"><label><input type="checkbox" name="remove_on_oos" value="1" '.checked($rule['remove_on_oos'], true, false).' /> Remove</label></td>';
 
 				echo '<td data-label="From date"><input type="text" name="from_dt" value="'.esc_attr($rule['from']).'" placeholder="YYYY-MM-DD HH:MM:SS" style="width:170px;" /></td>';
 				echo '<td data-label="To date"><input type="text" name="to_dt" value="'.esc_attr($rule['to']).'" placeholder="YYYY-MM-DD HH:MM:SS" style="width:170px;" /></td>';
@@ -607,7 +616,7 @@ final class LPMD_Mass_Discounts {
 				echo '</tr>';
 			}
 		} else {
-			echo '<tr><td colspan="8">No terms found.</td></tr>';
+			echo '<tr><td colspan="9">No terms found.</td></tr>';
 		}
 
 		echo '</tbody></table>';
@@ -1267,7 +1276,7 @@ final class LPMD_Mass_Discounts {
 
 					foreach ($variation_ids as $vid) {
 						$variation = wc_get_product((int)$vid);
-						if (!$variation || !$variation->is_in_stock()) continue;
+						if (!$variation) continue;
 
 						$changed = $this->apply_best_discount_to_item((int)$vid, $pid, $active_rule_cache, $override_other, $min_price);
 						if ($changed) $affected_products[] = $pid;
@@ -1285,11 +1294,6 @@ final class LPMD_Mass_Discounts {
 						$this->refresh_product_lookup_row($parent_id);
 					}
 				} else {
-					if (!$product->is_in_stock()) {
-						$processed++;
-						continue;
-					}
-
 					$changed = $this->apply_best_discount_to_item($pid, 0, $active_rule_cache, $override_other, $min_price);
 					if ($changed) $affected_products[] = $pid;
 					if ($changed && function_exists('wc_delete_product_transients')) {
@@ -1345,8 +1349,12 @@ final class LPMD_Mass_Discounts {
 		}
 		$regular = (float)$regular;
 
+		if ($this->is_item_stock_zero_or_backorder($item)) {
+			return $this->remove_if_ours($item_id);
+		}
+
 		// Find best applicable rule across category + brand + tag
-		$best = $this->get_best_applicable_rule_for_item($item_id, $parent_product_id, $regular, $active_rule_cache);
+		$best = $this->get_best_applicable_rule_for_item($item_id, $parent_product_id, $regular, $active_rule_cache, $item);
 
 		if ($best) {
 			$new_sale = $best['sale_price'];
@@ -1361,7 +1369,7 @@ final class LPMD_Mass_Discounts {
 		}
 	}
 
-	private function get_best_applicable_rule_for_item($item_id, $parent_product_id, $regular_price, &$active_rule_cache) {
+	private function get_best_applicable_rule_for_item($item_id, $parent_product_id, $regular_price, &$active_rule_cache, $item = null) {
 		$settings = $this->get_settings();
 		$brand_tax = $settings['brand_taxonomy'];
 		$rounding_mode = $this->normalize_rounding_mode($settings['rounding_mode'] ?? 'none');
@@ -1389,6 +1397,7 @@ final class LPMD_Mass_Discounts {
 
 		foreach ($candidates as $c) {
 			$key = $c['taxonomy'].':'.$c['term_id'];
+			if ($this->is_rule_blocked_for_item($item_id, $key)) continue;
 
 			if (!isset($active_rule_cache[$key])) {
 				$rule = $this->get_rule_for_term($c['taxonomy'], $c['term_id']);
@@ -1482,6 +1491,7 @@ final class LPMD_Mass_Discounts {
 		$this->set_post_meta_silent($item_id, self::PMETA_APPLIED_RULE, wp_json_encode($normalized_rule_ref));
 		$this->set_post_meta_silent($item_id, self::PMETA_APPLIED_AT, date_i18n('Y-m-d H:i:s', $this->now_ts()));
 		$this->set_post_meta_silent($item_id, self::PMETA_APPLIED_PRICE, $new_sale);
+		$this->unblock_rule_for_item($item_id, $normalized_rule_ref['type'].':'.$normalized_rule_ref['term_id']);
 		wp_cache_delete($item_id, 'post_meta');
 
 		return true;
@@ -1513,6 +1523,8 @@ final class LPMD_Mass_Discounts {
 			}
 		}
 
+		$this->maybe_block_removed_rule_for_item($item_id, $applied);
+
 		// Clear attribution
 		$this->delete_post_meta_silent($item_id, self::PMETA_APPLIED_RULE);
 		$this->delete_post_meta_silent($item_id, self::PMETA_PREV_SALE);
@@ -1521,6 +1533,98 @@ final class LPMD_Mass_Discounts {
 		wp_cache_delete($item_id, 'post_meta');
 
 		return true;
+	}
+
+
+	private function is_item_stock_zero_or_backorder($item) {
+		if (!$item || !is_object($item)) return false;
+
+		if (method_exists($item, 'is_on_backorder') && $item->is_on_backorder(1)) {
+			return true;
+		}
+
+		$managing_stock = method_exists($item, 'managing_stock') ? (bool)$item->managing_stock() : false;
+		if ($managing_stock) {
+			$qty = method_exists($item, 'get_stock_quantity') ? $item->get_stock_quantity() : null;
+			if ($qty !== null && is_numeric($qty) && (float)$qty <= 0) {
+				return true;
+			}
+		}
+
+		if (method_exists($item, 'is_in_stock') && !$item->is_in_stock()) {
+			return true;
+		}
+
+		return false;
+	}
+
+	private function maybe_block_removed_rule_for_item($item_id, $applied_rule_ref) {
+		if (!is_array($applied_rule_ref)) return;
+
+		$taxonomy = isset($applied_rule_ref['type']) ? sanitize_text_field((string)$applied_rule_ref['type']) : '';
+		$term_id = isset($applied_rule_ref['term_id']) ? (int)$applied_rule_ref['term_id'] : 0;
+		if ($taxonomy === '' || $term_id <= 0) return;
+
+		$rule = $this->get_rule_for_term($taxonomy, $term_id);
+		if (empty($rule['remove_on_oos'])) return;
+
+		$item = wc_get_product((int)$item_id);
+		if (!$this->is_item_stock_zero_or_backorder($item)) return;
+
+		$this->block_rule_for_item((int)$item_id, $taxonomy.':'.$term_id);
+	}
+
+	private function get_blocked_rules_for_item($item_id) {
+		$item_id = (int)$item_id;
+		if ($item_id <= 0) return [];
+
+		$raw = get_post_meta($item_id, self::PMETA_BLOCKED_RULES, true);
+		if (!$raw) return [];
+
+		$decoded = json_decode((string)$raw, true);
+		if (!is_array($decoded)) return [];
+
+		$blocked = [];
+		foreach ($decoded as $entry) {
+			$entry = sanitize_text_field((string)$entry);
+			if ($entry !== '') $blocked[$entry] = true;
+		}
+		return $blocked;
+	}
+
+	private function is_rule_blocked_for_item($item_id, $rule_key) {
+		$rule_key = sanitize_text_field((string)$rule_key);
+		if ($rule_key === '') return false;
+		$blocked = $this->get_blocked_rules_for_item((int)$item_id);
+		return isset($blocked[$rule_key]);
+	}
+
+	private function block_rule_for_item($item_id, $rule_key) {
+		$item_id = (int)$item_id;
+		$rule_key = sanitize_text_field((string)$rule_key);
+		if ($item_id <= 0 || $rule_key === '') return;
+
+		$blocked = $this->get_blocked_rules_for_item($item_id);
+		if (isset($blocked[$rule_key])) return;
+
+		$blocked[$rule_key] = true;
+		$this->set_post_meta_silent($item_id, self::PMETA_BLOCKED_RULES, wp_json_encode(array_keys($blocked)));
+	}
+
+	private function unblock_rule_for_item($item_id, $rule_key) {
+		$item_id = (int)$item_id;
+		$rule_key = sanitize_text_field((string)$rule_key);
+		if ($item_id <= 0 || $rule_key === '') return;
+
+		$blocked = $this->get_blocked_rules_for_item($item_id);
+		if (!isset($blocked[$rule_key])) return;
+
+		unset($blocked[$rule_key]);
+		if (empty($blocked)) {
+			$this->delete_post_meta_silent($item_id, self::PMETA_BLOCKED_RULES);
+		} else {
+			$this->set_post_meta_silent($item_id, self::PMETA_BLOCKED_RULES, wp_json_encode(array_keys($blocked)));
+		}
 	}
 
 	private function set_post_meta_silent($post_id, $meta_key, $meta_value) {
