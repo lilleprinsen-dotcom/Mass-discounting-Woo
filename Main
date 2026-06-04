@@ -1318,6 +1318,11 @@ final class LPMD_Mass_Discounts {
 			$pid = (int)$pid;
 			if ($pid <= 0 || get_post_type($pid) !== 'product') continue;
 
+			// This plugin only owns discount pricing. Snapshot the WooCommerce backorder allowance
+			// setting so price recalculations, variable-product syncs, or attached hooks cannot
+			// leave products with a changed "Allow backorders" value.
+			$backorders_snapshot = [];
+
 			try {
 				$product = wc_get_product($pid);
 				if (!$product) continue;
@@ -1328,6 +1333,7 @@ final class LPMD_Mass_Discounts {
 				if ($product->is_type('variable')) {
 					$variation_ids = $product->get_children();
 					$parent_id = $product->get_id();
+					$backorders_snapshot = $this->snapshot_backorders_meta(array_merge([$parent_id], array_map('intval', $variation_ids)));
 
 					foreach ($variation_ids as $vid) {
 						$variation = wc_get_product((int)$vid);
@@ -1349,6 +1355,7 @@ final class LPMD_Mass_Discounts {
 						$this->refresh_product_lookup_row($parent_id);
 					}
 				} else {
+					$backorders_snapshot = $this->snapshot_backorders_meta([$pid]);
 					$changed = $this->apply_best_discount_to_item($pid, 0, $active_rule_cache, $override_other, $min_price);
 					if ($changed) $affected_products[] = $pid;
 					if ($changed && function_exists('wc_delete_product_transients')) {
@@ -1362,6 +1369,8 @@ final class LPMD_Mass_Discounts {
 				$processed++;
 			} catch (Throwable $e) {
 				$errors[] = ['product_id'=>$pid, 'error'=>$e->getMessage()];
+			} finally {
+				$this->restore_backorders_meta($backorders_snapshot);
 			}
 		}
 
@@ -1715,6 +1724,45 @@ final class LPMD_Mass_Discounts {
 				],
 				['%d', '%s', '%s']
 			);
+		}
+	}
+
+	private function snapshot_backorders_meta($product_ids) {
+		$snapshot = [];
+
+		foreach (array_unique(array_map('intval', (array)$product_ids)) as $product_id) {
+			if ($product_id <= 0) continue;
+
+			$snapshot[$product_id] = [
+				'exists' => metadata_exists('post', $product_id, '_backorders'),
+				'value'  => get_post_meta($product_id, '_backorders', true),
+			];
+		}
+
+		return $snapshot;
+	}
+
+	private function restore_backorders_meta($snapshot) {
+		if (!is_array($snapshot) || empty($snapshot)) return;
+
+		foreach ($snapshot as $product_id => $state) {
+			$product_id = (int)$product_id;
+			if ($product_id <= 0 || !is_array($state)) continue;
+
+			$had_backorders_meta = !empty($state['exists']);
+			$previous_value = isset($state['value']) ? (string)$state['value'] : '';
+			$has_backorders_meta = metadata_exists('post', $product_id, '_backorders');
+			$current_value = get_post_meta($product_id, '_backorders', true);
+
+			if ($had_backorders_meta) {
+				if (!$has_backorders_meta || (string)$current_value !== $previous_value) {
+					$this->set_post_meta_silent($product_id, '_backorders', $previous_value);
+					wp_cache_delete($product_id, 'post_meta');
+				}
+			} elseif ($has_backorders_meta) {
+				$this->delete_post_meta_silent($product_id, '_backorders');
+				wp_cache_delete($product_id, 'post_meta');
+			}
 		}
 	}
 
