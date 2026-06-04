@@ -607,7 +607,7 @@ final class LPMD_Mass_Discounts {
 
 		$this->render_admin_header($title);
 
-		echo '<div class="lpmd-help"><p><strong>How to use this page:</strong> enable a rule, set discount type + amount, choose whether to remove it when stock hits 0/backorder, optionally schedule dates, then click <em>Save</em>. Use <em>Queue apply</em> to recalculate prices now or <em>Queue remove</em> to remove this rule from matching products.</p><p><strong>Date format:</strong> DD.MM.YYYY HH:MM:SS in your WordPress site timezone.</p></div>';
+		echo '<div class="lpmd-help"><p><strong>How to use this page:</strong> enable a rule, set discount type + amount, choose whether to remove it when stock hits 0 and backorders are not allowed, optionally schedule dates, then click <em>Save</em>. Use <em>Queue apply</em> to recalculate prices now or <em>Queue remove</em> to remove this rule from matching products.</p><p><strong>Date format:</strong> DD.MM.YYYY HH:MM:SS in your WordPress site timezone.</p></div>';
 		echo '<form method="get" style="margin:10px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">';
 		echo '<input type="hidden" name="page" value="'.esc_attr($page_slug).'" />';
 		echo '<input type="search" name="s" value="'.esc_attr($search).'" placeholder="Search term..." />';
@@ -622,7 +622,7 @@ final class LPMD_Mass_Discounts {
 		echo '<th>Amount(,-)</th>';
 		echo '<th>Apply</th>';
 		echo '<th>Schedule discount</th>';
-		echo '<th>Remove at stock 0/backorder</th>';
+		echo '<th>Remove at stock 0 (no backorders)</th>';
 		echo '<th>From Date (Server Time)</th>';
 		echo '<th>To Date (Server Time)</th>';
 		echo '<th>Queue</th>';
@@ -654,7 +654,7 @@ final class LPMD_Mass_Discounts {
 				echo '</td>';
 
 				echo '<td data-label="Schedule"><label><input type="checkbox" name="sched_enabled" value="1" '.checked($rule['sched_enabled'], true, false).' /> Scheduled</label></td>';
-				echo '<td data-label="Remove at stock 0/backorder"><label><input type="checkbox" name="remove_on_oos" value="1" '.checked($rule['remove_on_oos'], true, false).' /> Remove</label></td>';
+				echo '<td data-label="Remove at stock 0 (no backorders)"><label><input type="checkbox" name="remove_on_oos" value="1" '.checked($rule['remove_on_oos'], true, false).' /> Remove</label></td>';
 
 				echo '<td data-label="From date"><input type="text" name="from_dt" value="'.esc_attr($this->format_admin_datetime($rule['from'])).'" placeholder="DD.MM.YYYY HH:MM:SS" style="width:170px;" /></td>';
 				echo '<td data-label="To date"><input type="text" name="to_dt" value="'.esc_attr($this->format_admin_datetime($rule['to'])).'" placeholder="DD.MM.YYYY HH:MM:SS" style="width:170px;" /></td>';
@@ -1413,7 +1413,7 @@ final class LPMD_Mass_Discounts {
 		}
 		$regular = (float)$regular;
 
-		if ($this->is_item_stock_zero_or_backorder($item)) {
+		if ($this->should_remove_discount_for_stock_state($item)) {
 			return $this->remove_if_ours($item_id);
 		}
 
@@ -1600,11 +1600,13 @@ final class LPMD_Mass_Discounts {
 	}
 
 
-	private function is_item_stock_zero_or_backorder($item) {
+	private function should_remove_discount_for_stock_state($item) {
 		if (!$item || !is_object($item)) return false;
 
-		if (method_exists($item, 'is_on_backorder') && $item->is_on_backorder(1)) {
-			return true;
+		// Products that allow backorders should keep their sale price even when
+		// WooCommerce reports them as on backorder or at/below zero stock.
+		if ($this->item_allows_backorders($item)) {
+			return false;
 		}
 
 		$managing_stock = method_exists($item, 'managing_stock') ? (bool)$item->managing_stock() : false;
@@ -1617,6 +1619,24 @@ final class LPMD_Mass_Discounts {
 
 		if (method_exists($item, 'is_in_stock') && !$item->is_in_stock()) {
 			return true;
+		}
+
+		if (method_exists($item, 'is_on_backorder') && $item->is_on_backorder(1)) {
+			return true;
+		}
+
+		return false;
+	}
+
+	private function item_allows_backorders($item) {
+		if (!$item || !is_object($item)) return false;
+
+		if (method_exists($item, 'backorders_allowed')) {
+			return (bool)$item->backorders_allowed();
+		}
+
+		if (method_exists($item, 'get_backorders')) {
+			return in_array((string)$item->get_backorders(), ['yes', 'notify'], true);
 		}
 
 		return false;
@@ -1633,7 +1653,7 @@ final class LPMD_Mass_Discounts {
 		if (empty($rule['remove_on_oos'])) return;
 
 		$item = wc_get_product((int)$item_id);
-		if (!$this->is_item_stock_zero_or_backorder($item)) return;
+		if (!$this->should_remove_discount_for_stock_state($item)) return;
 
 		$this->block_rule_for_item((int)$item_id, $taxonomy.':'.$term_id);
 	}
